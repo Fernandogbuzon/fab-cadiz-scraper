@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Playwright
+html_downloads/
+
+# Logs
+*.log
+scraper_log.txt
+
+# Entorno local
+.env
+
+# Estado de reintentos (se gestiona en el repo, pero ignorar localmente si no quieres subir cambios manuales)
+# intentos_resultados.json  ← NO ignorar, el workflow lo necesita
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/

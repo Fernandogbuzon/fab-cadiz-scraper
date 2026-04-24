@@ -1,0 +1,118 @@
+name: "1. Calendario - Actualizar fechas y horarios"
+
+# Scraper completo: actualiza todas las competiciones, fechas, horarios.
+# Escribe los datos directamente en Supabase Central (fab-cadiz-central).
+# Los resultados los gestiona el workflow 2 (disparador + resultados).
+#
+# FLUJO:
+#   1. scraper_competicion.py → datos en Supabase directamente
+#
+# IMPORTANTE: TZ=Europe/Madrid para que datetime.now() use hora espanola
+
+on:
+  schedule:
+    # 15:00 Espana = 14:00 UTC (invierno) / 13:00 UTC (verano)
+    - cron: '0 13 * * *'
+    - cron: '0 14 * * *'
+    # 23:59 Espana = 22:59 UTC (invierno) / 21:59 UTC (verano)
+    - cron: '59 21 * * *'
+    - cron: '59 22 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: scraper-escritura
+  cancel-in-progress: false
+
+jobs:
+  actualizar-calendario:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      TZ: Europe/Madrid
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ref: main
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Cache Playwright
+        id: cache-pw
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+
+      - name: Instalar dependencias
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium
+          if [ "${{ steps.cache-pw.outputs.cache-hit }}" != "true" ]; then
+            playwright install-deps chromium
+          else
+            sudo apt-get install -y xvfb > /dev/null 2>&1
+          fi
+
+      - name: Ejecutar scraper completo
+        env:
+          CENTRAL_SUPABASE_URL: ${{ secrets.CENTRAL_SUPABASE_URL }}
+          CENTRAL_SUPABASE_SERVICE_KEY: ${{ secrets.CENTRAL_SUPABASE_SERVICE_KEY }}
+        run: |
+          xvfb-run --auto-servernum --server-args="-screen 0 1366x768x24" \
+            python scraper_competicion.py 2>&1
+
+      - name: Commit y push
+        run: |
+          git config --local user.name "GitHub Actions Bot"
+          git config --local user.email "actions@github.com"
+
+          echo "Sincronizando con remoto..."
+          git pull --rebase origin main || {
+            echo "Rebase fallido, resolviendo..."
+            git rebase --abort 2>/dev/null || true
+            git pull origin main --no-rebase || true
+          }
+
+          git add intentos_resultados.json 2>/dev/null || true
+
+          if git diff --cached --quiet; then
+            echo "Sin cambios que commitear"
+          else
+            TIMESTAMP=$(date '+%d/%m/%Y %H:%M')
+            git commit -m "Calendario actualizado - ${TIMESTAMP}" -m "Actualizacion automatica"
+
+            for intento in 1 2 3; do
+              if git push origin main; then
+                echo "Push exitoso (intento $intento)"
+                break
+              fi
+              echo "Push fallido (intento $intento/3), reintentando en 5s..."
+              sleep 5
+              git pull --rebase origin main || {
+                echo "Rebase con conflicto, haciendo abort + merge..."
+                git rebase --abort 2>/dev/null || true
+                git pull origin main --no-rebase || true
+              }
+              if [ "$intento" -eq 3 ]; then
+                echo "::error::No se pudo hacer push tras 3 intentos"
+                exit 1
+              fi
+            done
+          fi
+
+      - name: Resumen
+        if: always()
+        run: |
+          echo "### Scraper Calendario" >> $GITHUB_STEP_SUMMARY
+          echo "**Hora Espana:** $(date '+%d/%m/%Y %H:%M')" >> $GITHUB_STEP_SUMMARY

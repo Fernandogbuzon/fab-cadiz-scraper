@@ -1,0 +1,14 @@
+{
+  "_comment": "Copia este archivo como team_config.json y ajústalo a tu equipo",
+  "team_name": "NOMBRE DE TU EQUIPO",
+  "team_slug": "nombre-de-tu-equipo",
+  "province": "cadiz",
+  "province_base_url": "https://www.andaluzabaloncesto.org/cadiz",
+
+  "competitions": [
+    "https://www.andaluzabaloncesto.org/cadiz/delegacion-competicion-XXXX/nombre-competicion"
+  ],
+
+  "match_duration_hours": 2.5,
+  "max_retry_attempts": 3
+}

@@ -1,0 +1,65 @@
+{
+  "team_name": "ADESA 80",
+  "team_slug": "adesa-80",
+  "province": "cadiz",
+  "province_base_url": "https://www.andaluzabaloncesto.org/cadiz",
+
+  "competitions": [
+    "https://www.andaluzabaloncesto.org/cadiz/delegacion-competicion-2445/comp-copa-andalucia-a",
+    "https://www.andaluzabaloncesto.org/cadiz/delegacion-competicion-2446/comp-copa-andalucia-b",
+    "https://www.andaluzabaloncesto.org/cadiz/delegacion-competicion-2447/comp-1-a%C3%B1o"
+  ],
+
+  "match_duration_hours": 1,
+  "max_retry_attempts": 5,
+  "retry_interval_minutes": 10,
+
+  "_comment_playoff_formats": "Formatos de series playoff por competicion/categoria. 'series_games' = partidos totales en la serie. 'tiebreak' = metodo de desempate si empate en victorias: 'point_diff' (diferencia de puntos acumulada) o null (no aplica). 'categories' puede ser 'non-senior', 'senior', o lista de slugs de categoria como ['junior-masculino', 'junior-femenino'].",
+  "playoff_formats": [
+    {
+      "id": "copa-b-no-senior",
+      "description": "Copa Andalucia B (no Senior): 2 partidos por serie, desempate por diferencia de puntos. Aplica en Cuartos, Semifinal y Fase Final. La Final es a 1 partido.",
+      "competitions": ["copa-andalucia-b"],
+      "categories": "non-senior",
+      "phases": {
+        "cuartos-de-final": { "series_games": 2, "tiebreak": "point_diff" },
+        "semifinal":        { "series_games": 2, "tiebreak": "point_diff" },
+        "fase-final":       { "series_games": 2, "tiebreak": "point_diff" },
+        "final":            { "series_games": 1, "tiebreak": null }
+      }
+    },
+    {
+      "id": "copa-b-senior",
+      "description": "Copa Andalucia B (Senior): ida y vuelta, gana quien tiene mejor diferencia de puntos acumulada.",
+      "competitions": ["copa-andalucia-b"],
+      "categories": "senior",
+      "phases": {
+        "cuartos-de-final": { "series_games": 2, "tiebreak": "point_diff" },
+        "semifinal":        { "series_games": 2, "tiebreak": "point_diff" },
+        "fase-final":       { "series_games": 2, "tiebreak": "point_diff" },
+        "final":            { "series_games": 1, "tiebreak": null }
+      }
+    },
+    {
+      "id": "copa-a-senior",
+      "description": "Copa Andalucia A (Senior): formato por confirmar. Actualizar cuando se conozca.",
+      "competitions": ["copa-andalucia-a"],
+      "categories": "senior",
+      "phases": {
+        "cuartos-de-final": { "series_games": 2, "tiebreak": "point_diff" },
+        "semifinal":        { "series_games": 2, "tiebreak": "point_diff" },
+        "fase-final":       { "series_games": 2, "tiebreak": "point_diff" },
+        "final":            { "series_games": 1, "tiebreak": null }
+      }
+    },
+    {
+      "id": "default-best-of-3",
+      "description": "Formato por defecto (mejor de 3) para competiciones sin formato especificado.",
+      "competitions": [],
+      "categories": "all",
+      "phases": {
+        "_default": { "series_games": 3, "tiebreak": null }
+      }
+    }
+  ]
+}
