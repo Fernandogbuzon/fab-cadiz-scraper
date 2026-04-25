@@ -56,8 +56,8 @@ jobs:
 
           token = os.environ["GITHUB_TOKEN"]
           repo  = os.environ["GITHUB_REPOSITORY"]
-          SUPABASE_URL = os.environ.get("CENTRAL_SUPABASE_URL", "")
-          SUPABASE_KEY = os.environ.get("CENTRAL_SUPABASE_SERVICE_KEY", "")
+          SUPABASE_URL = os.environ.get("CENTRAL_SUPABASE_URL", "").strip()
+          SUPABASE_KEY = os.environ.get("CENTRAL_SUPABASE_SERVICE_KEY", "").strip()
           ahora = datetime.now()   # TZ=Europe/Madrid ya aplicado
           hoy   = ahora.strftime("%d/%m/%Y")
 
@@ -184,8 +184,8 @@ jobs:
           from pathlib import Path
           from datetime import datetime, timedelta
 
-          SUPABASE_URL = os.environ.get('CENTRAL_SUPABASE_URL', '')
-          SUPABASE_KEY = os.environ.get('CENTRAL_SUPABASE_SERVICE_KEY', '')
+          SUPABASE_URL = os.environ.get('CENTRAL_SUPABASE_URL', '').strip()
+          SUPABASE_KEY = os.environ.get('CENTRAL_SUPABASE_SERVICE_KEY', '').strip()
 
           cfg = json.loads(Path('team_config.json').read_text())
           TEAM_FIRST = cfg['team_name'].split()[0].upper()
