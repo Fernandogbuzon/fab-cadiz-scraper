@@ -671,10 +671,73 @@ async def scrape_grupo(page, comp_url, cat_carpeta, fase_carpeta, grupo_carpeta)
     return partidos
 
 
+async def scrape_otros_grupos_en_fase(
+    page, comp_url: str, cat_carpeta: str, fase_carpeta: str, grupo_excluir: str
+) -> list[dict]:
+    """
+    Escanea todos los grupos de una fase/categoría excepto el ya intentado.
+    Devuelve lista combinada de todos los partidos encontrados.
+    Útil cuando el group_id en DB no coincide con el grupo web real del partido.
+    """
+    all_partidos: list[dict] = []
+    comp_id = ""
+    if "/delegacion-competicion" in comp_url:
+        parts = comp_url.split("/delegacion-competicion")
+        comp_id = "/delegacion-competicion" + parts[1].split("/")[0]
+
+    if not comp_id or comp_id not in (page.url or ""):
+        await page.goto(comp_url, wait_until="domcontentloaded", timeout=60000)
+        if not await esperar_pagina(page, timeout=60000):
+            return []
+        await esperar_dropdown_con_opciones(page, SEL_CAT)
+        await pausa(0.5, 1.0)
+
+    cats = await obtener_opciones(page, SEL_CAT)
+    cats = [c for c in cats if c["value"]]
+    cat_value = match_opcion_a_carpeta(cats, cat_carpeta)
+    if not cat_value:
+        return []
+    if not await seleccionar_dropdown(page, SEL_CAT, DDL_CATEGORIAS, cat_value, max_retries=2):
+        return []
+    await esperar_dropdown_con_opciones(page, SEL_FASE)
+
+    fases = await obtener_opciones(page, SEL_FASE)
+    fases = [f for f in fases if f["value"]]
+    fase_value = match_opcion_a_carpeta(fases, fase_carpeta)
+    if not fase_value:
+        fase_value = fases[0]["value"] if len(fases) == 1 else None
+    if not fase_value:
+        return []
+    if not await seleccionar_dropdown(page, SEL_FASE, DDL_FASES, fase_value, max_retries=2):
+        return []
+    await esperar_dropdown_con_opciones(page, SEL_GRUPO)
+
+    grupos = await obtener_opciones(page, SEL_GRUPO)
+    grupos = [g for g in grupos if g["value"]]
+    grupo_excluir_value = match_opcion_a_carpeta(grupos, grupo_excluir)
+
+    for grupo_opt in grupos:
+        if grupo_opt["value"] == grupo_excluir_value:
+            continue
+        logger.info(f"  🔍 Grupo alternativo: '{grupo_opt['text']}'")
+        if not await seleccionar_dropdown(page, SEL_GRUPO, DDL_GRUPOS, grupo_opt["value"], max_retries=2):
+            continue
+        try:
+            cal_tab = page.locator("#calendario-tab")
+            if await cal_tab.count() > 0:
+                aria = await cal_tab.get_attribute("aria-selected")
+                if aria != "true":
+                    await cal_tab.click()
+                    await pausa(0.5, 1.0)
+        except Exception:
+            pass
+        partidos = await extraer_partidos_pagina(page)
+        logger.info(f"    {len(partidos)} partidos en '{grupo_opt['text']}'")
+        all_partidos.extend(partidos)
+
+    return all_partidos
 
 
-
-# ─── Actualizar resultados en Supabase ───────────────────────────────────────
 
 def actualizar_supabase_resultados(partidos_web: list[dict], group_id: str = None) -> set[str]:
     """
@@ -731,7 +794,8 @@ def actualizar_supabase_resultados(partidos_web: list[dict], group_id: str = Non
     ts = datetime.now().isoformat()
 
     def _buscar_db_match(fecha_web: str, loc_web: str, vis_web: str) -> Optional[dict]:
-        """Primero match exacto por clave; si falla, intento fuzzy por nombre de equipo."""
+        """Primero match exacto por clave; si falla, intento fuzzy por nombre de equipo.
+        Si sigue fallando, prueba ±1 día (la web y la BD a veces difieren en 1 día)."""
         fc = _fecha_clean(fecha_web)
         key = f"{fc}_{'_'.join(sorted([slugify(loc_web), slugify(vis_web)]))}"
         m = db_lookup.get(key)
@@ -747,6 +811,26 @@ def actualizar_supabase_resultados(partidos_web: list[dict], group_id: str = Non
                (nombres_coinciden(loc_web, db_vis) and nombres_coinciden(vis_web, db_loc)):
                 logger.info(f"  Fuzzy match: '{loc_web}' → '{db_loc}' / '{vis_web}' → '{db_vis}'")
                 return db_m
+        # Fallback ±1 día: a veces la federación registra el partido con 1 día de diferencia
+        try:
+            d, mo, y = fecha_web.split("/")
+            dt_base = datetime(int(y), int(mo), int(d))
+            for delta in (-1, 1):
+                fc_adj = _fecha_clean((dt_base + timedelta(days=delta)).strftime("%d/%m/%Y"))
+                for db_key, db_m in db_lookup.items():
+                    if not db_key.startswith(fc_adj + "_"):
+                        continue
+                    db_loc = db_m.get("local", "")
+                    db_vis = db_m.get("visitante", "")
+                    if (nombres_coinciden(loc_web, db_loc) and nombres_coinciden(vis_web, db_vis)) or \
+                       (nombres_coinciden(loc_web, db_vis) and nombres_coinciden(vis_web, db_loc)):
+                        logger.info(
+                            f"  Match ±1 día: web={fecha_web} → DB={db_m.get('fecha','')} "
+                            f"'{db_loc}' vs '{db_vis}'"
+                        )
+                        return db_m
+        except Exception:
+            pass
         return None
 
     sin_match: list[str] = []
@@ -972,9 +1056,47 @@ async def actualizar_resultados(headless: bool = False, check_only: bool = False
                                 logger.info(f"  La web aún no tiene marcador para este partido.")
                         else:
                             logger.warning(
-                                f"  ⚠️  Partido NO encontrado en web: "
-                                f"'{p['local']}' vs '{p['visitante']}' ({p.get('fecha','')})"
+                                f"  ⚠️  Partido NO encontrado en grupo '{grupo_carpeta}'. "
+                                f"Probando otros grupos de la fase '{fase_carpeta}'..."
                             )
+                            # Buscar en otros grupos de la misma fase/categoría
+                            try:
+                                partidos_alt = await scrape_otros_grupos_en_fase(
+                                    page, comp_url, cat_carpeta, fase_carpeta, grupo_carpeta
+                                )
+                                pw_alt = [
+                                    pw for pw in partidos_alt
+                                    if nombres_coinciden(pw.get("local", ""), p["local"])
+                                    and nombres_coinciden(pw.get("visitante", ""), p["visitante"])
+                                ]
+                                if pw_alt:
+                                    pw0 = pw_alt[0]
+                                    logger.info(
+                                        f"  Partido encontrado en otro grupo: "
+                                        f"fecha={pw0.get('fecha','')} resultado={pw0.get('es_resultado')}"
+                                    )
+                                    if pw0.get("es_resultado"):
+                                        # Actualizar sin filtro de group_id (el partido está mal asignado en DB)
+                                        pids_extra = actualizar_supabase_resultados(
+                                            [pw0], group_id=None
+                                        )
+                                        if pid in pids_extra:
+                                            intentos.pop(pid, None)
+                                            total_actualizados += 1
+                                            logger.info(
+                                                f"  ✅ RESULTADO actualizado desde grupo alternativo: "
+                                                f"{pw0['local']} {pw0['marcador_local']}-"
+                                                f"{pw0['marcador_visitante']} {pw0['visitante']}"
+                                            )
+                                    else:
+                                        logger.info(f"  Partido en otro grupo pero aún sin marcador.")
+                                else:
+                                    logger.warning(
+                                        f"  ⚠️  Partido '{p['local']}' vs '{p['visitante']}' "
+                                        f"({p.get('fecha','')}) no encontrado en ningún grupo."
+                                    )
+                            except Exception as e_alt:
+                                logger.warning(f"  ⚠️  Error en búsqueda alternativa: {e_alt}")
 
             await pausa(0.5, 1.0)
 
