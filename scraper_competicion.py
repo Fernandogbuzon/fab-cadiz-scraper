@@ -35,6 +35,7 @@ import argparse
 import random
 import logging
 import unicodedata
+import hashlib
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -85,6 +86,9 @@ TEAM_NAME = _CFG["team_name"]
 TEAM_SLUG = _CFG["team_slug"]
 COMPETICIONES = _CFG["competitions"]
 PLAYOFF_FORMATS = _CFG.get("playoff_formats", [])
+# Si True, obtiene las URLs de competiciones desde club_competitions de Supabase
+# en lugar de leerlas de team_config.json.
+COMPETITIONS_FROM_DB = _CFG.get("competitions_from_db", False)
 
 
 def get_series_format(comp_slug: str, cat_slug: str, fase_slug: str) -> dict:
@@ -183,6 +187,23 @@ async def pausa(lo: float = 0.8, hi: float = 2.5):
     await asyncio.sleep(random.uniform(lo, hi))
 
 
+async def esperar_dropdown_con_opciones(page, selector: str, timeout: int = 15000) -> bool:
+    """Espera a que un dropdown tenga al menos una opción con valor cargada.
+    Más preciso que una pausa fija: retorna en cuanto el DOM está listo."""
+    try:
+        selector_escaped = selector.replace("'", "\\'")
+        await page.wait_for_function(
+            f"""() => {{
+                const sel = document.querySelector('{selector_escaped}');
+                return sel && Array.from(sel.options).some(o => o.value && o.value.trim() !== '');
+            }}""",
+            timeout=timeout,
+        )
+        return True
+    except Exception:
+        return False
+
+
 # ─── Browser helpers ─────────────────────────────────────────────────────────
 
 async def crear_browser(headless: bool = False):
@@ -258,29 +279,29 @@ async def seleccionar_dropdown(page, selector: str, ddl_name: str, value: str, m
             try:
                 async with page.expect_navigation(wait_until="load", timeout=90000):
                     await page.select_option(selector, value)
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(0.3)
             except Exception as nav_error:
                 # La navegación puede fallar si es muy rápida o no hay cambio real
                 logger.debug(f"  Navigation event timeout (puede ser normal): {nav_error}")
-                await asyncio.sleep(2.0)
-            
+                await asyncio.sleep(0.8)
+
             # Verificar que la página esté lista
             ok = await esperar_pagina(page, timeout=90000)
             if ok:
-                await pausa(1.5, 3.0)  # Pausa más larga para estabilidad
+                await pausa(0.5, 1.2)  # Reducido: esperar_pagina ya garantiza DOM listo
                 return True
-            
+
             if intento < max_retries - 1:
                 logger.warning(f"  ⚠️ Intento {intento + 1}/{max_retries} falló para {ddl_name}, reintentando...")
-                await asyncio.sleep(3.0)
+                await asyncio.sleep(2.0)
             else:
                 logger.error(f"  ❌ Error tras {max_retries} intentos de postback de {ddl_name}")
                 return False
-                
+
         except Exception as e:
             if intento < max_retries - 1:
                 logger.warning(f"  ⚠️ Error en intento {intento + 1}/{max_retries}: {e}")
-                await asyncio.sleep(3.0)
+                await asyncio.sleep(2.0)
             else:
                 logger.error(f"  ❌ Error crítico tras {max_retries} intentos: {e}")
                 return False
@@ -482,17 +503,138 @@ def calcular_clasificacion(partidos: list[dict], cat: str, fase: str, grupo: str
     }
 
 
+# ─── URLs dinámicas desde club_competitions ──────────────────────────────────
+
+def obtener_urls_desde_db() -> list[str]:
+    """
+    Lee las URLs de competición desde club_competitions de Supabase.
+    Filtra por club activo (clubs.active=true) y enlace activo (club_competitions.active=true).
+    Fallback a COMPETICIONES del config si falla.
+    """
+    sb = get_supabase()
+    if not sb:
+        return COMPETICIONES
+    try:
+        res = sb.table("club_competitions").select(
+            "competition_url, clubs!inner(active)"
+        ).eq("active", True).eq("clubs.active", True).execute()
+        urls = list({r["competition_url"] for r in (res.data or []) if r.get("competition_url")})
+        if urls:
+            logger.info(f"📡 {len(urls)} URL(s) de competición obtenidas desde DB (club_competitions)")
+            return urls
+        logger.warning("⚠️ club_competitions vacío, usando config local")
+    except Exception as e:
+        logger.warning(f"⚠️ No se pudo leer club_competitions: {e}. Usando config.")
+    return COMPETICIONES
+
+
+# ─── Content hashing (detección de cambios) ──────────────────────────────────
+
+def _hash_partidos(partidos: list[dict]) -> str:
+    """Hash SHA-256 reproducible de los partidos de un grupo para detectar cambios."""
+    key_fields = ["fecha", "local", "visitante", "marcador_local", "marcador_visitante", "hora", "pabellon"]
+    normalized = sorted(
+        [{k: p.get(k) for k in key_fields} for p in partidos],
+        key=lambda p: (p.get("fecha", ""), p.get("local", ""), p.get("visitante", ""))
+    )
+    return hashlib.sha256(json.dumps(normalized, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
+def _grupo_sin_cambios(sb, group_id: str, new_hash: str) -> bool:
+    """
+    Retorna True si el hash del grupo no cambió respecto al último scrape.
+    Actualiza el registro de hash si hubo cambio.
+    """
+    try:
+        res = sb.table("content_hashes").select("id, content_hash").eq(
+            "entity_type", "group"
+        ).eq("entity_id", group_id).execute()
+        if res.data:
+            row = res.data[0]
+            if row["content_hash"] == new_hash:
+                return True
+            sb.table("content_hashes").update({
+                "content_hash": new_hash,
+                "scraped_at": datetime.now().isoformat(),
+            }).eq("id", row["id"]).execute()
+        else:
+            sb.table("content_hashes").insert({
+                "entity_type": "group",
+                "entity_id": group_id,
+                "content_hash": new_hash,
+                "scraped_at": datetime.now().isoformat(),
+            }).execute()
+        return False
+    except Exception as e:
+        logger.warning(f"      ⚠️ content_hashes check error: {e}")
+        return False  # En caso de error, proceder con upsert normal
+
+
+# ─── scraper_runs: registro de ejecuciones ───────────────────────────────────
+
+def _run_comenzar(run_type: str = "full") -> Optional[str]:
+    """Registra el inicio de una ejecución. Devuelve el run_id."""
+    sb = get_supabase()
+    if not sb:
+        return None
+    try:
+        res = sb.table("scraper_runs").insert({
+            "run_type": run_type,
+            "status": "running",
+            "club_ids": [],
+        }).execute()
+        return res.data[0]["id"] if res.data else None
+    except Exception as e:
+        logger.warning(f"  ⚠️ No se pudo registrar scraper_run: {e}")
+        return None
+
+
+def _run_finalizar(run_id: Optional[str], status: str, comps: int,
+                   groups_scraped: int, groups_skipped: int,
+                   matches_upserted: int, errors: list):
+    """Actualiza el registro de ejecución al finalizar."""
+    if not run_id:
+        return
+    sb = get_supabase()
+    if not sb:
+        return
+    try:
+        sb.table("scraper_runs").update({
+            "status": status,
+            "competitions_processed": comps,
+            "groups_scraped": groups_scraped,
+            "groups_skipped": groups_skipped,
+            "matches_upserted": matches_upserted,
+            "errors": errors,
+            "finished_at": datetime.now().isoformat(),
+        }).eq("id", run_id).execute()
+    except Exception as e:
+        logger.warning(f"  ⚠️ No se pudo actualizar scraper_run: {e}")
+
+
 # ─── Guardado Supabase ───────────────────────────────────────────────────────
+
+# Cache en memoria para IDs de entidades ya upsertadas en esta ejecución.
+# Evita re-upserts reduntantes: con 3 competiciones x 5 cats x 4 grupos = 60 groups,
+# sin caché habría 60 upserts de competition + 60 de category + 60 de group.
+_entity_cache: dict = {}
+
 
 def _upsert_competition(sb, comp_nombre: str, comp_carpeta: str, comp_url: str) -> str | None:
     """Asegura que la competición existe. Devuelve su UUID."""
+    cache_key = f"comp:{comp_carpeta}"
+    if cache_key in _entity_cache:
+        return _entity_cache[cache_key]
     slug = comp_carpeta
     try:
         res = sb.table("competitions").upsert(
             {"slug": slug, "name": comp_nombre, "url": comp_url, "updated_at": datetime.now().isoformat()},
             on_conflict="slug"
         ).execute()
-        return res.data[0]["id"] if res.data else None
+        result = res.data[0]["id"] if res.data else None
+        if result:
+            _entity_cache[cache_key] = result
+        return result
     except Exception as e:
         logger.error(f"  ❌ Supabase upsert competition: {e}")
         return None
@@ -500,12 +642,18 @@ def _upsert_competition(sb, comp_nombre: str, comp_carpeta: str, comp_url: str) 
 
 def _upsert_category(sb, comp_id: str, cat_nombre: str) -> str | None:
     slug = normalizar_carpeta(cat_nombre)
+    cache_key = f"cat:{comp_id}:{slug}"
+    if cache_key in _entity_cache:
+        return _entity_cache[cache_key]
     try:
         res = sb.table("comp_categories").upsert(
             {"competition_id": comp_id, "slug": slug, "name": cat_nombre},
             on_conflict="competition_id,slug"
         ).execute()
-        return res.data[0]["id"] if res.data else None
+        result = res.data[0]["id"] if res.data else None
+        if result:
+            _entity_cache[cache_key] = result
+        return result
     except Exception as e:
         logger.error(f"  ❌ Supabase upsert category: {e}")
         return None
@@ -514,12 +662,18 @@ def _upsert_category(sb, comp_id: str, cat_nombre: str) -> str | None:
 def _upsert_group(sb, cat_id: str, fase: str, grupo: str) -> str | None:
     phase = normalizar_carpeta(fase)
     name = normalizar_carpeta(grupo)
+    cache_key = f"group:{cat_id}:{phase}:{name}"
+    if cache_key in _entity_cache:
+        return _entity_cache[cache_key]
     try:
         res = sb.table("comp_groups").upsert(
             {"category_id": cat_id, "phase": phase, "name": name},
             on_conflict="category_id,phase,name"
         ).execute()
-        return res.data[0]["id"] if res.data else None
+        result = res.data[0]["id"] if res.data else None
+        if result:
+            _entity_cache[cache_key] = result
+        return result
     except Exception as e:
         logger.error(f"  ❌ Supabase upsert group: {e}")
         return None
@@ -529,26 +683,35 @@ def guardar_supabase(
     partidos: list[dict], clasif: dict,
     cat: str, grupo: str, fase: str,
     comp_nombre: str, comp_carpeta: str, comp_url: str
-):
-    """Guarda partidos y clasificaciones en Supabase (además de JSON)."""
+) -> bool:
+    """
+    Guarda partidos y clasificaciones en Supabase.
+    Retorna True si hubo cambios (datos escritos), False si el grupo no cambió (hash idéntico).
+    """
     sb = get_supabase()
     if not sb:
-        return
+        return True  # Sin Supabase, asumir que hay que procesar
 
     # 1. Competición
     comp_id = _upsert_competition(sb, comp_nombre, comp_carpeta, comp_url)
     if not comp_id:
-        return
+        return True
 
     # 2. Categoría
     cat_id = _upsert_category(sb, comp_id, cat)
     if not cat_id:
-        return
+        return True
 
     # 3. Grupo
     group_id = _upsert_group(sb, cat_id, fase, grupo)
     if not group_id:
-        return
+        return True
+
+    # ── Verificar content hash (delta): si los datos no cambiaron, saltar escrituras ──
+    nuevo_hash = _hash_partidos(partidos)
+    if _grupo_sin_cambios(sb, group_id, nuevo_hash):
+        logger.info(f"      ⏭️  Sin cambios (hash idéntico), saltando escrituras Supabase")
+        return False
 
     # 4. Partidos – upsert por match_key (dedup por match_key para evitar error 21000)
     matches_dict = {}
@@ -714,6 +877,8 @@ def guardar_supabase(
         except Exception as e:
             logger.error(f"      ❌ Supabase standings: {e}")
 
+    return True
+
 
 # ─── Nombre de competición desde la página ──────────────────────────────────
 
@@ -760,7 +925,9 @@ async def scrape_una_competicion(
     if not await esperar_pagina(page, timeout=60000):
         logger.error("❌ No se pudo cargar la página")
         return 0, ""
-    await pausa(2.0, 4.0)
+    # Esperar a que las categorías tengan opciones (más preciso que pausa fija)
+    await esperar_dropdown_con_opciones(page, SEL_CAT)
+    await pausa(0.5, 1.2)
 
     # Obtener nombre real de la competición
     comp_nombre = await obtener_nombre_competicion(page)
@@ -783,6 +950,8 @@ async def scrape_una_competicion(
         return 0, comp_carpeta
 
     total_partidos = 0
+    grupos_scrapeados = 0
+    grupos_saltados = 0
 
     for cat_idx, cat in enumerate(categorias):
         cat_nombre = cat["text"]
@@ -797,9 +966,10 @@ async def scrape_una_competicion(
         ok = await seleccionar_dropdown(page, SEL_CAT, DDL_CATEGORIAS, cat_value, max_retries=3)
         if not ok:
             logger.error(f"  ❌ No se pudo cambiar a {cat_nombre} tras múltiples intentos")
-            # Esperar antes de continuar con la siguiente categoría
-            await asyncio.sleep(5.0)
+            await asyncio.sleep(3.0)
             continue
+        # Esperar a que las fases se carguen antes de leerlas
+        await esperar_dropdown_con_opciones(page, SEL_FASE)
 
         # Leer fases
         fases = await obtener_opciones(page, SEL_FASE)
@@ -818,8 +988,10 @@ async def scrape_una_competicion(
             ok = await seleccionar_dropdown(page, SEL_FASE, DDL_FASES, fase_value, max_retries=2)
             if not ok:
                 logger.warning(f"    ⚠️ No se pudo cambiar a fase {fase_nombre}")
-                await asyncio.sleep(3.0)
+                await asyncio.sleep(2.0)
                 continue
+            # Esperar a que los grupos se carguen antes de leerlos
+            await esperar_dropdown_con_opciones(page, SEL_GRUPO)
 
             # Leer grupos
             grupos = await obtener_opciones(page, SEL_GRUPO)
@@ -838,7 +1010,7 @@ async def scrape_una_competicion(
                 ok = await seleccionar_dropdown(page, SEL_GRUPO, DDL_GRUPOS, grupo_value, max_retries=2)
                 if not ok:
                     logger.warning(f"      ⚠️ No se pudo cambiar a grupo {grupo_nombre}")
-                    await asyncio.sleep(3.0)
+                    await asyncio.sleep(2.0)
                     continue
 
                 # Asegurar tab CALENDARIO activo
@@ -870,18 +1042,23 @@ async def scrape_una_competicion(
                 clasif = calcular_clasificacion(
                     partidos, cat_nombre, fase_nombre, grupo_nombre, comp_nombre
                 )
-                guardar_supabase(
+                hubo_cambios = guardar_supabase(
                     partidos, clasif,
                     cat_nombre, grupo_nombre, fase_nombre,
                     comp_nombre, comp_carpeta, url
                 )
+                if hubo_cambios:
+                    grupos_scrapeados += 1
+                else:
+                    grupos_saltados += 1
 
-                await pausa(0.8, 1.8)
-            await pausa(1.0, 2.5)
-        await pausa(2.0, 4.0)
+                await pausa(0.3, 0.7)
+            await pausa(0.4, 0.9)
+        await pausa(0.8, 1.8)
 
-    logger.info(f"\n  ✅ {comp_nombre}: {total_partidos} partidos")
-    return total_partidos, comp_carpeta
+    logger.info(f"\n  ✅ {comp_nombre}: {total_partidos} partidos "
+                f"({grupos_scrapeados} grupos escritos, {grupos_saltados} sin cambios)")
+    return total_partidos, comp_carpeta, grupos_scrapeados, grupos_saltados
 
 
 # ─── Scraper principal (todas las competiciones) ─────────────────────────────
@@ -890,71 +1067,124 @@ async def scrape_todas(
     filtro_comp: Optional[str] = None,
     filtro_cat: Optional[str] = None,
     headless: bool = False,
+    parallel: bool = False,
 ):
+    # Obtener URLs: desde DB si está configurado, sino desde config local
+    urls_base = obtener_urls_desde_db() if COMPETITIONS_FROM_DB else COMPETICIONES
+
     logger.info("=" * 60)
     logger.info(f"🏀 SCRAPER COMPETICIONES – {TEAM_NAME}")
-    logger.info(f"📋 {len(COMPETICIONES)} competiciones registradas")
+    logger.info(f"📋 {len(urls_base)} competiciones {'(desde DB)' if COMPETITIONS_FROM_DB else '(desde config)'}")
     logger.info("=" * 60)
 
+    run_id = _run_comenzar(run_type="full")
     pw, browser, context, page = await crear_browser(headless=headless)
 
     gran_total_partidos = 0
+    total_groups_scraped = 0
+    total_groups_skipped = 0
     resultados = []
+    run_errors: list = []
+    run_status = "completed"
+
+    from urllib.parse import unquote as _unquote
+    urls_filtradas = []
+    for url in urls_base:
+        if filtro_comp:
+            slug_decoded = _unquote(url.rstrip("/").split("/")[-1]).lower()
+            filtro_norm = filtro_comp.lower().replace(" ", "-")
+            if filtro_norm not in slug_decoded:
+                continue
+        urls_filtradas.append(url)
 
     try:
-        for comp_idx, url in enumerate(COMPETICIONES):
-            # Filtrar por nombre de competición si se especificó
-            if filtro_comp:
-                slug = url.rstrip("/").split("/")[-1]
-                from urllib.parse import unquote
-                slug_decoded = unquote(slug).lower()
-                # Normalizar el filtro: espacios → guiones para que coincida con el slug de la URL
-                filtro_norm = filtro_comp.lower().replace(" ", "-")
-                if filtro_norm not in slug_decoded:
-                    continue
+        if parallel and len(urls_filtradas) > 1:
+            # ── Modo paralelo: una pestaña por competición ──────────────────
+            logger.info(f"⚡ Modo paralelo: {len(urls_filtradas)} competiciones en paralelo")
+            pages_extra = [await context.new_page() for _ in range(len(urls_filtradas) - 1)]
+            all_pages = [page] + pages_extra
 
-            logger.info(f"\n{'═' * 60}")
-            logger.info(f"🏆 [{comp_idx + 1}/{len(COMPETICIONES)}] {url}")
-            logger.info(f"{'═' * 60}")
-
-            try:
-                tp, comp_carpeta = await scrape_una_competicion(page, url, filtro_cat)
-                gran_total_partidos += tp
-                resultados.append((url, tp, "✅", comp_carpeta))
-            except Exception as e:
-                logger.error(f"❌ Error en competición: {e}", exc_info=True)
-                resultados.append((url, 0, f"❌ {e}", ""))
-                # Renavegar a una página limpia para recuperar
+            async def _scrape_con_retraso(p, url, delay: float):
+                if delay > 0:
+                    await asyncio.sleep(delay)
                 try:
-                    await page.goto("about:blank")
-                    await pausa(1.0, 2.0)
-                except Exception:
-                    pass
+                    tp, comp_carpeta, gs, gsk = await scrape_una_competicion(p, url, filtro_cat)
+                    return (url, tp, "✅", comp_carpeta, gs, gsk, None)
+                except Exception as exc:
+                    logger.error(f"❌ Error en competición: {exc}", exc_info=True)
+                    return (url, 0, f"❌ {exc}", "", 0, 0, str(exc))
 
-            await pausa(3.0, 6.0)
+            tasks = [
+                _scrape_con_retraso(all_pages[i], url, i * 3.0)
+                for i, url in enumerate(urls_filtradas)
+            ]
+            resultados = list(await asyncio.gather(*tasks))
+            for r in resultados:
+                gran_total_partidos += r[1]
+                total_groups_scraped += r[4]
+                total_groups_skipped += r[5]
+                if r[6]:
+                    run_errors.append({"url": r[0], "error": r[6]})
+
+        else:
+            # ── Modo secuencial (defecto) ────────────────────────────────────
+            for comp_idx, url in enumerate(urls_filtradas):
+                logger.info(f"\n{'═' * 60}")
+                logger.info(f"🏆 [{comp_idx + 1}/{len(urls_filtradas)}] {url}")
+                logger.info(f"{'═' * 60}")
+
+                try:
+                    tp, comp_carpeta, gs, gsk = await scrape_una_competicion(page, url, filtro_cat)
+                    gran_total_partidos += tp
+                    total_groups_scraped += gs
+                    total_groups_skipped += gsk
+                    resultados.append((url, tp, "✅", comp_carpeta, gs, gsk, None))
+                except Exception as e:
+                    logger.error(f"❌ Error en competición: {e}", exc_info=True)
+                    run_errors.append({"url": url, "error": str(e)})
+                    resultados.append((url, 0, f"❌ {e}", "", 0, 0, str(e)))
+                    try:
+                        await page.goto("about:blank")
+                        await pausa(1.0, 2.0)
+                    except Exception:
+                        pass
+
+                if comp_idx < len(urls_filtradas) - 1:
+                    await pausa(1.5, 3.0)
 
         # Resumen final
         logger.info(f"\n{'═' * 60}")
         logger.info("📊 RESUMEN FINAL")
         logger.info(f"{'═' * 60}")
-        for url, tp, status, _ in resultados:
-            slug = url.rstrip("/").split("/")[-1]
-            logger.info(f"  {status} {slug}: {tp} partidos")
+        for r in resultados:
+            slug = r[0].rstrip("/").split("/")[-1]
+            logger.info(f"  {r[2]} {slug}: {r[1]} partidos (escritos:{r[4]} skip:{r[5]})")
         logger.info(f"{'─' * 60}")
-        logger.info(f"  TOTAL: {gran_total_partidos} partidos → Supabase")
+        logger.info(f"  TOTAL: {gran_total_partidos} partidos | "
+                    f"grupos escritos: {total_groups_scraped} | sin cambios: {total_groups_skipped}")
         logger.info(f"{'═' * 60}")
 
     except Exception as e:
         logger.error(f"❌ Error crítico: {e}", exc_info=True)
+        run_errors.append({"error": str(e)})
+        run_status = "failed"
         raise
     finally:
         await browser.close()
         await pw.stop()
+        _run_finalizar(
+            run_id, run_status,
+            comps=len(resultados),
+            groups_scraped=total_groups_scraped,
+            groups_skipped=total_groups_skipped,
+            matches_upserted=gran_total_partidos,
+            errors=run_errors,
+        )
 
 
 # ─── Modo automático ─────────────────────────────────────────────────────────
 
-async def modo_automatico(headless: bool = False, filtro_comp: Optional[str] = None):
+async def modo_automatico(headless: bool = False, filtro_comp: Optional[str] = None, parallel: bool = False):
     """
     Lun–Vie: cada 2 horas.
     Sáb–Dom 8:00–23:59: cada 30 minutos.
@@ -962,7 +1192,7 @@ async def modo_automatico(headless: bool = False, filtro_comp: Optional[str] = N
     logger.info("🔄 Modo automático activado")
     while True:
         try:
-            await scrape_todas(filtro_comp=filtro_comp, headless=headless)
+            await scrape_todas(filtro_comp=filtro_comp, headless=headless, parallel=parallel)
         except Exception as e:
             logger.error(f"❌ Error: {e}")
 
@@ -991,15 +1221,31 @@ def main():
                         help="Filtrar por nombre de competición (busca en el slug de la URL)")
     parser.add_argument("--categoria", type=str, default=None, help="Filtrar categoría")
     parser.add_argument("--headless", action="store_true", help="Modo headless (puede fallar con CF)")
+    parser.add_argument("--parallel", action="store_true",
+                        help="Scrapear competiciones en paralelo (una pestaña por competición, "
+                             "más rápido pero mayor carga para el servidor)")
+    parser.add_argument("--from-db", action="store_true",
+                        help="Obtener URLs de competición desde club_competitions (Supabase) "
+                             "en vez de team_config.json")
     args = parser.parse_args()
 
+    # --from-db sobreescribe competitions_from_db del config para esta ejecución
+    if args.from_db:
+        import scraper_competicion as _self
+        _self.COMPETITIONS_FROM_DB = True
+
     if args.watch:
-        asyncio.run(modo_automatico(headless=args.headless, filtro_comp=args.competicion))
+        asyncio.run(modo_automatico(
+            headless=args.headless,
+            filtro_comp=args.competicion,
+            parallel=args.parallel,
+        ))
     else:
         asyncio.run(scrape_todas(
             filtro_comp=args.competicion,
             filtro_cat=args.categoria,
             headless=args.headless,
+            parallel=args.parallel,
         ))
 
 

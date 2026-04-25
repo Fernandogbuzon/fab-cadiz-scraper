@@ -10,5 +10,8 @@
   ],
 
   "match_duration_hours": 2.5,
-  "max_retry_attempts": 3
+  "max_retry_attempts": 3,
+  "retry_interval_minutes": 10,
+  "watch_all_clubs": false,
+  "competitions_from_db": false
 }

@@ -13,6 +13,8 @@
   "match_duration_hours": 1,
   "max_retry_attempts": 5,
   "retry_interval_minutes": 10,
+  "watch_all_clubs": false,
+  "competitions_from_db": false,
 
   "_comment_playoff_formats": "Formatos de series playoff por competicion/categoria. 'series_games' = partidos totales en la serie. 'tiebreak' = metodo de desempate si empate en victorias: 'point_diff' (diferencia de puntos acumulada) o null (no aplica). 'categories' puede ser 'non-senior', 'senior', o lista de slugs de categoria como ['junior-masculino', 'junior-femenino'].",
   "playoff_formats": [
