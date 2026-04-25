@@ -54,8 +54,15 @@ def get_supabase():
     global _supabase_client
     if _supabase_client is not None:
         return _supabase_client
-    url = os.environ.get("CENTRAL_SUPABASE_URL") or os.environ.get("SUPABASE_URL")
-    key = os.environ.get("CENTRAL_SUPABASE_SERVICE_KEY") or os.environ.get("SUPABASE_SERVICE_KEY")
+    url = (os.environ.get("CENTRAL_SUPABASE_URL") or os.environ.get("SUPABASE_URL") or "")
+    key = (os.environ.get("CENTRAL_SUPABASE_SERVICE_KEY") or os.environ.get("SUPABASE_SERVICE_KEY") or "")
+    # Garantizar str puro (httpx rechaza bytes como header value)
+    if isinstance(url, bytes):
+        url = url.decode("utf-8")
+    if isinstance(key, bytes):
+        key = key.decode("utf-8")
+    url = url.strip()
+    key = key.strip()
     if not url or not key:
         logger.warning("⚠️ CENTRAL_SUPABASE_URL/CENTRAL_SUPABASE_SERVICE_KEY no configuradas. Solo se guardarán JSON locales.")
         return None
