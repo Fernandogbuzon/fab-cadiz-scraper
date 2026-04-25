@@ -745,10 +745,11 @@ def actualizar_supabase_resultados(partidos_web: list[dict], group_id: str = Non
             db_vis = db_m.get("visitante", "")
             if (nombres_coinciden(loc_web, db_loc) and nombres_coinciden(vis_web, db_vis)) or \
                (nombres_coinciden(loc_web, db_vis) and nombres_coinciden(vis_web, db_loc)):
-                logger.debug(f"  Fuzzy match: '{loc_web}' vs '{db_loc}' / '{vis_web}' vs '{db_vis}'")
+                logger.info(f"  Fuzzy match: '{loc_web}' → '{db_loc}' / '{vis_web}' → '{db_vis}'")
                 return db_m
         return None
 
+    sin_match: list[str] = []
     for pw in con_resultado:
         loc = pw.get("local", "").strip()
         vis = pw.get("visitante", "").strip()
@@ -756,7 +757,7 @@ def actualizar_supabase_resultados(partidos_web: list[dict], group_id: str = Non
             continue
         db_match = _buscar_db_match(pw.get("fecha", ""), loc, vis)
         if not db_match:
-            logger.debug(f"  Sin match DB: {pw.get('fecha','')} {loc} vs {vis}")
+            sin_match.append(f"{pw.get('fecha','')} {loc} vs {vis}")
             continue
         if db_match.get("es_resultado"):
             # Ya tiene resultado — registrar como actualizado sin re-escribir
@@ -784,6 +785,8 @@ def actualizar_supabase_resultados(partidos_web: list[dict], group_id: str = Non
         except Exception as e:
             logger.error(f"  Supabase batch update error: {e}")
 
+    if sin_match:
+        logger.warning(f"  ⚠️  {len(sin_match)} resultado(s) web sin match en DB: {sin_match}")
     if actualizados:
         logger.info(f"  🗄️  Supabase: {len(actualizados)} resultado(s) encontrados")
     return actualizados
@@ -948,6 +951,30 @@ async def actualizar_resultados(headless: bool = False, check_only: bool = False
                         marcar_supabase_estado(pid, estado_new)
                     else:
                         logger.info(f"  Sin resultado ({n}/{MAX_INTENTOS}). Se reintentara en ~{RETRY_INTERVAL_MIN}min.")
+                        # Diagnóstico: ¿está el partido en la web (con o sin marcador)?
+                        pw_en_web = [
+                            pw for pw in partidos_web
+                            if pw.get("fecha", "") == p.get("fecha", "")
+                            and nombres_coinciden(pw.get("local", ""), p["local"])
+                            and nombres_coinciden(pw.get("visitante", ""), p["visitante"])
+                        ]
+                        if pw_en_web:
+                            pw0 = pw_en_web[0]
+                            if pw0.get("es_resultado"):
+                                logger.warning(
+                                    f"  ⚠️  La web SÍ tiene resultado "
+                                    f"({pw0['marcador_local']}-{pw0['marcador_visitante']}) "
+                                    f"pero falló el cruce con DB. "
+                                    f"Web: '{pw0['local']}' vs '{pw0['visitante']}' | "
+                                    f"DB: '{p['local']}' vs '{p['visitante']}'"
+                                )
+                            else:
+                                logger.info(f"  La web aún no tiene marcador para este partido.")
+                        else:
+                            logger.warning(
+                                f"  ⚠️  Partido NO encontrado en web: "
+                                f"'{p['local']}' vs '{p['visitante']}' ({p.get('fecha','')})"
+                            )
 
             await pausa(0.5, 1.0)
 
