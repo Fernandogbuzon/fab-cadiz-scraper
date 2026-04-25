@@ -577,6 +577,16 @@ def match_opcion_a_carpeta(opciones: list[dict], carpeta: str) -> Optional[str]:
     if best_match and best_score >= 0.5:
         return best_match
 
+    # Paso 3: Match por números extraídos (ej: "JORNADAS-5ª-10ª" → "5 10",
+    # útil cuando la web cambia la literalidad pero conserva el rango numérico)
+    nums_carpeta = re.findall(r"\d+", carpeta_ascii)
+    if len(nums_carpeta) >= 2:
+        for opt in opciones:
+            nums_opt = re.findall(r"\d+", strip_accents(opt["text"]))
+            if nums_carpeta == nums_opt:
+                logger.debug(f"  Fase matcheada por números {nums_carpeta}: '{carpeta}' → '{opt['text']}'")
+                return opt["value"]
+
     return None
 
 
@@ -620,7 +630,8 @@ async def scrape_grupo(page, comp_url, cat_carpeta, fase_carpeta, grupo_carpeta)
     if not fase_value:
         fase_value = fases[0]["value"] if len(fases) == 1 else None
     if not fase_value:
-        logger.error(f"  Fase '{fase_carpeta}' no encontrada")
+        opciones_disp = [f["text"] for f in fases]
+        logger.error(f"  Fase '{fase_carpeta}' no encontrada. Opciones disponibles: {opciones_disp}")
         return []
 
     logger.info(f"  Fase: {fase_carpeta}")
@@ -692,27 +703,60 @@ def actualizar_supabase_resultados(partidos_web: list[dict], group_id: str = Non
         logger.error(f"  Supabase select error: {e}")
         return set()
 
+    db_rows = existing.data or []
+    if not db_rows:
+        logger.warning(f"  ⚠️  DB devolvió 0 filas para group_id={group_id}. "
+                       "Puede que el calendario no esté en Supabase para este grupo.")
+        return set()
+
     # 2. Construir lookup: fecha_sin_barras + equipos_ordenados → match de BD
+    #    Normalizamos las fechas a DDMMYYYY con ceros (ej: "25/4/2026" → "25042026")
+    def _fecha_clean(f: str) -> str:
+        parts = f.split("/")
+        if len(parts) == 3:
+            return f"{parts[0].zfill(2)}{parts[1].zfill(2)}{parts[2]}"
+        return f.replace("/", "")
+
     db_lookup: dict[str, dict] = {}
-    for m in (existing.data or []):
-        fecha_clean = m.get("fecha", "").replace("/", "")
+    for m in db_rows:
+        fc = _fecha_clean(m.get("fecha", ""))
         eq_sorted = "_".join(sorted([slugify(m.get("local", "")), slugify(m.get("visitante", ""))]))
-        db_lookup[f"{fecha_clean}_{eq_sorted}"] = m
+        db_lookup[f"{fc}_{eq_sorted}"] = m
+
+    logger.info(f"  🗄️  Supabase: {len(db_rows)} matches en el grupo para cruzar")
 
     # 3. Cruzar resultados web con matches de BD
     updates: list[dict] = []
     actualizados: set[str] = set()
     ts = datetime.now().isoformat()
 
+    def _buscar_db_match(fecha_web: str, loc_web: str, vis_web: str) -> Optional[dict]:
+        """Primero match exacto por clave; si falla, intento fuzzy por nombre de equipo."""
+        fc = _fecha_clean(fecha_web)
+        key = f"{fc}_{'_'.join(sorted([slugify(loc_web), slugify(vis_web)]))}"
+        m = db_lookup.get(key)
+        if m:
+            return m
+        # Fallback fuzzy: misma fecha normalizada, nombres similares
+        for db_key, db_m in db_lookup.items():
+            if not db_key.startswith(fc + "_"):
+                continue
+            db_loc = db_m.get("local", "")
+            db_vis = db_m.get("visitante", "")
+            if (nombres_coinciden(loc_web, db_loc) and nombres_coinciden(vis_web, db_vis)) or \
+               (nombres_coinciden(loc_web, db_vis) and nombres_coinciden(vis_web, db_loc)):
+                logger.debug(f"  Fuzzy match: '{loc_web}' vs '{db_loc}' / '{vis_web}' vs '{db_vis}'")
+                return db_m
+        return None
+
     for pw in con_resultado:
-        fecha_clean = pw.get("fecha", "").replace("/", "")
         loc = pw.get("local", "").strip()
         vis = pw.get("visitante", "").strip()
         if not loc or not vis:
             continue
-        key = f"{fecha_clean}_{'_'.join(sorted([slugify(loc), slugify(vis)]))}"
-        db_match = db_lookup.get(key)
+        db_match = _buscar_db_match(pw.get("fecha", ""), loc, vis)
         if not db_match:
+            logger.debug(f"  Sin match DB: {pw.get('fecha','')} {loc} vs {vis}")
             continue
         if db_match.get("es_resultado"):
             # Ya tiene resultado — registrar como actualizado sin re-escribir
