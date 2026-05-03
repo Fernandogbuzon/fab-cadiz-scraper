@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
+from scraper_common import build_match_key, slugify as _shared_slugify
 
 # Cargar .env desde la carpeta del script
 load_dotenv(Path(__file__).parent / ".env")
@@ -163,11 +164,7 @@ logger = logging.getLogger(__name__)
 # ─── Utilidades ──────────────────────────────────────────────────────────────
 
 def slugify(text: str) -> str:
-    text = unicodedata.normalize("NFD", text)
-    text = text.encode("ascii", "ignore").decode("ascii")
-    text = re.sub(r"[^\w\s-]", "", text).strip().lower()
-    text = re.sub(r"[-\s]+", "-", text)
-    return text
+    return _shared_slugify(text)
 
 
 def normalizar_carpeta(nombre: str) -> str:
@@ -729,10 +726,7 @@ def guardar_supabase(
             continue
 
         # match_key: fecha + equipos ordenados + categoría (dedup)
-        fecha_clean = p.get("fecha", "").replace("/", "")
-        equipos_sorted = "_".join(sorted([slugify(loc), slugify(vis)]))
-        cat_slug = slugify(cat)
-        match_key = f"{fecha_clean}_{equipos_sorted}_{cat_slug}"
+        match_key = build_match_key(p.get("fecha", ""), loc, vis, cat)
 
         estado = "finalizado" if p.get("es_resultado") else "proximo"
         # Si ya existe, preferir la versión con resultado

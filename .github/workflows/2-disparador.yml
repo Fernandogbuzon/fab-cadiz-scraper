@@ -77,6 +77,7 @@ jobs:
           team_cfg = get_raw("team_config.json") or {}
           TEAM_FIRST = (team_cfg.get("team_name", "ADESA") or "ADESA").split()[0].upper()
           DURACION_H = team_cfg.get("match_duration_hours", 1)
+          MAX_RETRIES = team_cfg.get("max_retry_attempts", 5)
 
           # 1. Partidos del equipo hoy con ventana de tiempo util (consulta Supabase):
           #    activa desde 30 min antes del fin hasta 180 min despues (3h).
@@ -133,10 +134,33 @@ jobs:
               try:
                   ultimo = datetime.fromisoformat(v.get("ultimo", "2000-01-01"))
                   mins   = (ahora - ultimo).total_seconds() / 60
-                  if v.get("intentos", 0) < 5 and mins < 360:
+                  if v.get("intentos", 0) < MAX_RETRIES and mins < 360:
                       active_retries.append(k)
               except Exception:
                   pass
+
+          # 2b. Reintentos activos en Supabase. El scraper escribe aqui cuando
+          #     CENTRAL_SUPABASE_* esta configurado; el JSON local es solo fallback.
+          if SUPABASE_URL and SUPABASE_KEY:
+              cutoff = (ahora - timedelta(hours=6)).isoformat()
+              cutoff_enc = urllib.parse.quote_plus(cutoff)
+              retries_url = (f"{SUPABASE_URL}/rest/v1/scraper_retries"
+                             f"?select=match_key,intento,ultimo"
+                             f"&ultimo=gt.{cutoff_enc}"
+                             f"&intento=lt.{MAX_RETRIES}")
+              req = urllib.request.Request(
+                  retries_url,
+                  headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+              )
+              try:
+                  with urllib.request.urlopen(req, timeout=10) as r:
+                      retries_db = json.loads(r.read())
+                  for row in retries_db:
+                      mk = row.get("match_key")
+                      if mk and mk not in active_retries:
+                          active_retries.append(mk)
+              except Exception as e:
+                  print(f"  [warn] Error consultando scraper_retries: {e}. Usando JSON local.")
 
           run = len(en_ventana) > 0 or len(active_retries) > 0
 

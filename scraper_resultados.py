@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
+from scraper_common import build_lookup_key, fecha_key, parse_fecha_hora, slugify as _shared_slugify
 
 # Cargar .env
 load_dotenv(Path(__file__).parent / ".env")
@@ -201,25 +202,11 @@ def resetear_intentos():
 # ─── Utilidades ──────────────────────────────────────────────────────────────
 
 def parse_fecha(fecha_str: str, hora_str: str) -> datetime:
-    try:
-        d, m, y = fecha_str.split("/")
-        dt = datetime(int(y), int(m), int(d))
-        if hora_str and ":" in hora_str:
-            h, mi = hora_str.split(":")
-            dt = dt.replace(hour=int(h), minute=int(mi))
-        else:
-            dt = dt.replace(hour=12, minute=0)
-        return dt
-    except Exception:
-        return datetime(2000, 1, 1)
+    return parse_fecha_hora(fecha_str, hora_str)
 
 
 def slugify(text: str) -> str:
-    text = unicodedata.normalize("NFD", text)
-    text = text.encode("ascii", "ignore").decode("ascii")
-    text = re.sub(r"[^\w\s-]", "", text).strip().lower()
-    text = re.sub(r"[-\s]+", "-", text)
-    return text
+    return _shared_slugify(text)
 
 
 async def pausa(lo: float = 0.5, hi: float = 1.5):
@@ -774,17 +761,9 @@ def actualizar_supabase_resultados(partidos_web: list[dict], group_id: str = Non
 
     # 2. Construir lookup: fecha_sin_barras + equipos_ordenados → match de BD
     #    Normalizamos las fechas a DDMMYYYY con ceros (ej: "25/4/2026" → "25042026")
-    def _fecha_clean(f: str) -> str:
-        parts = f.split("/")
-        if len(parts) == 3:
-            return f"{parts[0].zfill(2)}{parts[1].zfill(2)}{parts[2]}"
-        return f.replace("/", "")
-
     db_lookup: dict[str, dict] = {}
     for m in db_rows:
-        fc = _fecha_clean(m.get("fecha", ""))
-        eq_sorted = "_".join(sorted([slugify(m.get("local", "")), slugify(m.get("visitante", ""))]))
-        db_lookup[f"{fc}_{eq_sorted}"] = m
+        db_lookup[build_lookup_key(m.get("fecha", ""), m.get("local", ""), m.get("visitante", ""))] = m
 
     logger.info(f"  🗄️  Supabase: {len(db_rows)} matches en el grupo para cruzar")
 
@@ -796,8 +775,8 @@ def actualizar_supabase_resultados(partidos_web: list[dict], group_id: str = Non
     def _buscar_db_match(fecha_web: str, loc_web: str, vis_web: str) -> Optional[dict]:
         """Primero match exacto por clave; si falla, intento fuzzy por nombre de equipo.
         Si sigue fallando, prueba ±1 día (la web y la BD a veces difieren en 1 día)."""
-        fc = _fecha_clean(fecha_web)
-        key = f"{fc}_{'_'.join(sorted([slugify(loc_web), slugify(vis_web)]))}"
+        fc = fecha_key(fecha_web)
+        key = build_lookup_key(fecha_web, loc_web, vis_web)
         m = db_lookup.get(key)
         if m:
             return m
@@ -816,7 +795,7 @@ def actualizar_supabase_resultados(partidos_web: list[dict], group_id: str = Non
             d, mo, y = fecha_web.split("/")
             dt_base = datetime(int(y), int(mo), int(d))
             for delta in (-1, 1):
-                fc_adj = _fecha_clean((dt_base + timedelta(days=delta)).strftime("%d/%m/%Y"))
+                fc_adj = fecha_key((dt_base + timedelta(days=delta)).strftime("%d/%m/%Y"))
                 for db_key, db_m in db_lookup.items():
                     if not db_key.startswith(fc_adj + "_"):
                         continue
