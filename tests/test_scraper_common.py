@@ -3,6 +3,7 @@ import unittest
 from scraper_common import (
     build_lookup_key,
     build_match_key,
+    build_stable_match_key,
     fecha_iso,
     fecha_key,
     legacy_fecha_key,
@@ -34,6 +35,28 @@ class ScraperCommonTests(unittest.TestCase):
         a = build_lookup_key("5/4/2026", "ADESA 80", "CB Cadiz")
         b = build_lookup_key("05/04/2026", "CB Cadiz", "ADESA 80")
         self.assertEqual(a, b)
+
+    def test_stable_match_key_excludes_date(self):
+        a = build_stable_match_key(
+            "copa-andalucia-b",
+            "Junior Masculino",
+            "Regular",
+            "Grupo A",
+            "Jornada 1",
+            "ADESA 80",
+            "CB Cadiz",
+        )
+        b = build_stable_match_key(
+            "copa-andalucia-b",
+            "Junior Masculino",
+            "Regular",
+            "Grupo A",
+            "Jornada 1",
+            "CB Cadiz",
+            "ADESA 80",
+        )
+        self.assertEqual(a, b)
+        self.assertNotIn("2026", a)
 
     def test_parse_fecha_hora(self):
         dt = parse_fecha_hora("5/4/2026", "18:30")

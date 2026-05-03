@@ -41,7 +41,12 @@ from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
-from scraper_common import build_match_key, slugify as _shared_slugify
+from scraper_common import (
+    build_match_key,
+    build_stable_match_key,
+    fecha_iso,
+    slugify as _shared_slugify,
+)
 
 # Cargar .env desde la carpeta del script
 load_dotenv(Path(__file__).parent / ".env")
@@ -622,6 +627,7 @@ def _run_finalizar(run_id: Optional[str], status: str, comps: int,
 # Evita re-upserts reduntantes: con 3 competiciones x 5 cats x 4 grupos = 60 groups,
 # sin caché habría 60 upserts de competition + 60 de category + 60 de group.
 _entity_cache: dict = {}
+_supports_normalized_match_fields: Optional[bool] = None
 
 
 def _upsert_competition(sb, comp_nombre: str, comp_carpeta: str, comp_url: str) -> str | None:
@@ -682,6 +688,44 @@ def _upsert_group(sb, cat_id: str, fase: str, grupo: str) -> str | None:
         logger.error(f"  ❌ Supabase upsert group: {e}")
         return None
 
+def _is_missing_normalized_column_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    normalized_cols = ("fecha_iso", "local_slug", "visitante_slug", "stable_match_key")
+    return any(col in text for col in normalized_cols) and (
+        "column" in text or "schema cache" in text or "could not find" in text
+    )
+
+
+def _strip_normalized_match_fields(rows: list[dict]) -> list[dict]:
+    normalized_cols = {"fecha_iso", "local_slug", "visitante_slug", "stable_match_key"}
+    return [{k: v for k, v in row.items() if k not in normalized_cols} for row in rows]
+
+
+def _upsert_matches_batch(sb, rows: list[dict]) -> bool:
+    """Upsert matches, falling back when optional normalized columns are absent."""
+    global _supports_normalized_match_fields
+    if not rows:
+        return True
+
+    use_normalized = _supports_normalized_match_fields is not False
+    rows_to_write = rows if use_normalized else _strip_normalized_match_fields(rows)
+
+    try:
+        for i in range(0, len(rows_to_write), 100):
+            sb.table("matches").upsert(rows_to_write[i:i+100], on_conflict="match_key").execute()
+        if use_normalized:
+            _supports_normalized_match_fields = True
+        return True
+    except Exception as e:
+        if use_normalized and _is_missing_normalized_column_error(e):
+            logger.warning("      ⚠️ Columnas normalizadas no disponibles en DB; usando contrato legacy.")
+            _supports_normalized_match_fields = False
+            legacy_rows = _strip_normalized_match_fields(rows)
+            for i in range(0, len(legacy_rows), 100):
+                sb.table("matches").upsert(legacy_rows[i:i+100], on_conflict="match_key").execute()
+            return True
+        raise
+
 
 def guardar_supabase(
     partidos: list[dict], clasif: dict,
@@ -738,9 +782,21 @@ def guardar_supabase(
             "competition_id": comp_id,
             "jornada": p.get("jornada", ""),
             "fecha": p.get("fecha", ""),
+            "fecha_iso": fecha_iso(p.get("fecha", "")) or None,
             "hora": p.get("hora", ""),
             "local": loc,
             "visitante": vis,
+            "local_slug": slugify(loc),
+            "visitante_slug": slugify(vis),
+            "stable_match_key": build_stable_match_key(
+                comp_carpeta,
+                cat,
+                fase,
+                grupo,
+                p.get("jornada", ""),
+                loc,
+                vis,
+            ),
             "marcador_local": p.get("marcador_local"),
             "marcador_visitante": p.get("marcador_visitante"),
             "pabellon": p.get("pabellon", ""),
@@ -826,10 +882,7 @@ def guardar_supabase(
                 logger.warning(f"      ⚠️ No se pudo preservar estados terminales: {e}")
 
         try:
-            # Upsert en bloques de 100
-            for i in range(0, len(matches_to_upsert), 100):
-                batch = matches_to_upsert[i:i+100]
-                sb.table("matches").upsert(batch, on_conflict="match_key").execute()
+            _upsert_matches_batch(sb, matches_to_upsert)
             logger.info(f"      🗄️  Supabase: {len(matches_to_upsert)} partidos")
         except Exception as e:
             logger.error(f"      ❌ Supabase upsert matches: {e}")

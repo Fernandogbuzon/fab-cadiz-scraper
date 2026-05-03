@@ -52,6 +52,27 @@ def build_match_key(fecha: str, local: str, visitante: str, categoria: str) -> s
     return f"{legacy_fecha_key(fecha)}_{equipos_key(local, visitante)}_{slugify(categoria)}"
 
 
+def build_stable_match_key(
+    competition_slug: str,
+    category: str,
+    phase: str,
+    group: str,
+    jornada: str,
+    local: str,
+    visitante: str,
+) -> str:
+    """Date-independent key for future migrations and cross-app reconciliation."""
+    parts = [
+        slugify(competition_slug),
+        slugify(category),
+        slugify(phase),
+        slugify(group),
+        slugify(jornada),
+        equipos_key(local, visitante),
+    ]
+    return "_".join(p for p in parts if p)
+
+
 def build_lookup_key(fecha: str, local: str, visitante: str) -> str:
     """Canonical lookup key for matching web rows to DB rows."""
     return f"{fecha_key(fecha)}_{equipos_key(local, visitante)}"
