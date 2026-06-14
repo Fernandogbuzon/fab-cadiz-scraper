@@ -286,7 +286,7 @@ def buscar_partidos_pendientes() -> list[dict]:
 
     try:
         query = sb.table("matches").select(
-            "match_key, fecha, hora, local, visitante, estado, group_id, "
+            "match_key, fecha, hora, local, visitante, estado, group_id, competition_id, "
             "comp_groups!inner(phase, name, "
             "comp_categories!inner(slug, "
             "competitions!inner(slug, url)))"
@@ -340,6 +340,7 @@ def buscar_partidos_pendientes() -> list[dict]:
             "fase_carpeta": cg.get("phase", ""),
             "grupo_carpeta": cg.get("name", ""),
             "group_id": m.get("group_id", ""),
+            "competition_id": m.get("competition_id", ""),
             "dt_inicio": dt_inicio,
             "pid": pid,
             "intento": n_intentos + 1,
@@ -542,6 +543,7 @@ def match_opcion_a_carpeta(opciones: list[dict], carpeta: str) -> Optional[str]:
 
     # Paso 2: Substring match - buscar el MEJOR match (más largo overlap)
     best_match = None
+    best_text = ""
     best_score = 0
     for opt in opciones:
         opt_ascii = strip_accents(opt["text"])
@@ -555,13 +557,17 @@ def match_opcion_a_carpeta(opciones: list[dict], carpeta: str) -> Optional[str]:
             if score > best_score:
                 best_score = score
                 best_match = opt["value"]
+                best_text = opt["text"]
         elif opt_ascii in carpeta_ascii:
             score = len(opt_ascii) / max(len(carpeta_ascii), 1)
             if score > best_score:
                 best_score = score
                 best_match = opt["value"]
+                best_text = opt["text"]
 
     if best_match and best_score >= 0.5:
+        # Match no exacto: registrar para que los mis-bindings sean visibles en logs CI
+        logger.info(f"  Match aproximado (substring, score={best_score:.2f}): '{carpeta}' → '{best_text}'")
         return best_match
 
     # Paso 3: Match por números extraídos (ej: "JORNADAS-5ª-10ª" → "5 10",
@@ -571,7 +577,7 @@ def match_opcion_a_carpeta(opciones: list[dict], carpeta: str) -> Optional[str]:
         for opt in opciones:
             nums_opt = re.findall(r"\d+", strip_accents(opt["text"]))
             if nums_carpeta == nums_opt:
-                logger.debug(f"  Fase matcheada por números {nums_carpeta}: '{carpeta}' → '{opt['text']}'")
+                logger.info(f"  Fase matcheada por números {nums_carpeta}: '{carpeta}' → '{opt['text']}'")
                 return opt["value"]
 
     return None
@@ -659,13 +665,23 @@ async def scrape_grupo(page, comp_url, cat_carpeta, fase_carpeta, grupo_carpeta)
 
 
 async def scrape_otros_grupos_en_fase(
-    page, comp_url: str, cat_carpeta: str, fase_carpeta: str, grupo_excluir: str
+    page, comp_url: str, cat_carpeta: str, fase_carpeta: str, grupo_excluir: str,
+    cache: dict | None = None,
 ) -> list[dict]:
     """
-    Escanea todos los grupos de una fase/categoría excepto el ya intentado.
-    Devuelve lista combinada de todos los partidos encontrados.
+    Escanea TODOS los grupos de una fase/categoría y devuelve la lista combinada de partidos.
     Útil cuando el group_id en DB no coincide con el grupo web real del partido.
+
+    `cache` (dict por ejecución, clave=(comp_url,cat,fase)): escanea la fase UNA sola vez por
+    ejecución. Evita el blow-up N×G de postbacks cuando varios partidos sin resultado caen en
+    la misma fase (cada postback puede tardar ~90s y reventar el límite de 12 min del job CI).
+    `grupo_excluir` se conserva por compatibilidad de firma; ya no se excluye ningún grupo para
+    que la caché cubra la fase completa (correcto para cualquier partido de la fase).
     """
+    cache_key = (comp_url, cat_carpeta, fase_carpeta)
+    if cache is not None and cache_key in cache:
+        logger.info(f"  ♻️  Fase '{fase_carpeta}' ya escaneada en esta ejecución (caché)")
+        return cache[cache_key]
     all_partidos: list[dict] = []
     comp_id = ""
     if "/delegacion-competicion" in comp_url:
@@ -701,12 +717,9 @@ async def scrape_otros_grupos_en_fase(
 
     grupos = await obtener_opciones(page, SEL_GRUPO)
     grupos = [g for g in grupos if g["value"]]
-    grupo_excluir_value = match_opcion_a_carpeta(grupos, grupo_excluir)
 
     for grupo_opt in grupos:
-        if grupo_opt["value"] == grupo_excluir_value:
-            continue
-        logger.info(f"  🔍 Grupo alternativo: '{grupo_opt['text']}'")
+        logger.info(f"  🔍 Grupo de la fase: '{grupo_opt['text']}'")
         if not await seleccionar_dropdown(page, SEL_GRUPO, DDL_GRUPOS, grupo_opt["value"], max_retries=2):
             continue
         try:
@@ -722,15 +735,21 @@ async def scrape_otros_grupos_en_fase(
         logger.info(f"    {len(partidos)} partidos en '{grupo_opt['text']}'")
         all_partidos.extend(partidos)
 
+    if cache is not None:
+        cache[cache_key] = all_partidos
     return all_partidos
 
 
 
-def actualizar_supabase_resultados(partidos_web: list[dict], group_id: str = None) -> set[str]:
+def actualizar_supabase_resultados(partidos_web: list[dict], group_id: str = None,
+                                   competition_id: str = None) -> set[str]:
     """
     Actualiza resultados de partidos en Supabase a partir de los datos web.
     Devuelve el set de match_keys actualizados.
     Si se pasa group_id, filtra por ese grupo para evitar contaminación entre categorías.
+    Si NO hay group_id (búsqueda en grupos alternativos) pero sí competition_id, acota a
+    esa competición: evita escanear toda la tabla matches y, sobre todo, evita cruzar un
+    resultado con un partido de OTRA competición (mismo nombre de equipo, fecha similar).
 
     Implementación batch: 1 SELECT para obtener todos los matches del grupo +
     1 upsert masivo. Evita el patrón N×(SELECT LIKE + UPDATE) del código anterior.
@@ -748,6 +767,8 @@ def actualizar_supabase_resultados(partidos_web: list[dict], group_id: str = Non
         query = sb.table("matches").select("id, match_key, fecha, local, visitante, es_resultado")
         if group_id:
             query = query.eq("group_id", group_id)
+        elif competition_id:
+            query = query.eq("competition_id", competition_id)
         existing = query.execute()
     except Exception as e:
         logger.error(f"  Supabase select error: {e}")
@@ -941,6 +962,9 @@ async def actualizar_resultados(headless: bool = False, check_only: bool = False
     run_errors: list = []
     intentos = cargar_intentos()
     run_status = "completed"
+    # Caché por ejecución: escanea cada fase (comp_url,cat,fase) una sola vez al buscar
+    # partidos en grupos alternativos (evita N×G postbacks).
+    otros_grupos_cache: dict = {}
 
     try:
         for key, partidos_grupo in grupos.items():
@@ -1041,7 +1065,8 @@ async def actualizar_resultados(headless: bool = False, check_only: bool = False
                             # Buscar en otros grupos de la misma fase/categoría
                             try:
                                 partidos_alt = await scrape_otros_grupos_en_fase(
-                                    page, comp_url, cat_carpeta, fase_carpeta, grupo_carpeta
+                                    page, comp_url, cat_carpeta, fase_carpeta, grupo_carpeta,
+                                    cache=otros_grupos_cache,
                                 )
                                 pw_alt = [
                                     pw for pw in partidos_alt
@@ -1057,7 +1082,8 @@ async def actualizar_resultados(headless: bool = False, check_only: bool = False
                                     if pw0.get("es_resultado"):
                                         # Actualizar sin filtro de group_id (el partido está mal asignado en DB)
                                         pids_extra = actualizar_supabase_resultados(
-                                            [pw0], group_id=None
+                                            [pw0], group_id=None,
+                                            competition_id=p.get("competition_id") or None,
                                         )
                                         if pid in pids_extra:
                                             intentos.pop(pid, None)
@@ -1112,7 +1138,15 @@ def main():
         resetear_intentos()
         return
 
-    asyncio.run(actualizar_resultados(headless=args.headless, check_only=args.check))
+    try:
+        n = asyncio.run(actualizar_resultados(headless=args.headless, check_only=args.check))
+    except Exception as e:
+        logger.error(f"Fallo no controlado en scraper_resultados: {e}", exc_info=True)
+        print("RESULT_COUNT=0")
+        sys.exit(1)
+    # Señal legible por CI: nº de resultados actualizados (0 en --check o sin novedades).
+    print(f"RESULT_COUNT={n or 0}")
+    sys.exit(0)
 
 
 if __name__ == "__main__":

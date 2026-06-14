@@ -552,30 +552,22 @@ def _hash_partidos(partidos: list[dict]) -> str:
 def _grupo_sin_cambios(sb, group_id: str, new_hash: str) -> bool:
     """
     Retorna True si el hash del grupo no cambió respecto al último scrape.
-    Actualiza el registro de hash si hubo cambio.
+
+    Usa la RPC atómica check_content_changed (INSERT ... ON CONFLICT en una sola
+    sentencia) en vez de un select-then-update/insert, que tenía una carrera entre
+    ejecuciones solapadas (cron calendario + disparador) capaz de duplicar el hash.
+    La RPC devuelve True si CAMBIÓ (y actualiza el hash); aquí invertimos a "sin cambios".
     """
     try:
-        res = sb.table("content_hashes").select("id, content_hash").eq(
-            "entity_type", "group"
-        ).eq("entity_id", group_id).execute()
-        if res.data:
-            row = res.data[0]
-            if row["content_hash"] == new_hash:
-                return True
-            sb.table("content_hashes").update({
-                "content_hash": new_hash,
-                "scraped_at": datetime.now().isoformat(),
-            }).eq("id", row["id"]).execute()
-        else:
-            sb.table("content_hashes").insert({
-                "entity_type": "group",
-                "entity_id": group_id,
-                "content_hash": new_hash,
-                "scraped_at": datetime.now().isoformat(),
-            }).execute()
-        return False
+        res = sb.rpc("check_content_changed", {
+            "p_entity_type": "group",
+            "p_entity_id": group_id,
+            "p_new_hash": new_hash,
+        }).execute()
+        changed = bool(res.data)
+        return not changed
     except Exception as e:
-        logger.warning(f"      ⚠️ content_hashes check error: {e}")
+        logger.warning(f"      ⚠️ content_hashes RPC error: {e}")
         return False  # En caso de error, proceder con upsert normal
 
 
@@ -908,8 +900,6 @@ def guardar_supabase(
     clasif_data = clasif.get("clasificacion", [])
     if clasif_data:
         try:
-            # Borrar clasificación anterior del grupo
-            sb.table("standings").delete().eq("group_id", group_id).execute()
             standings_rows = []
             for eq in clasif_data:
                 standings_rows.append({
@@ -925,9 +915,16 @@ def guardar_supabase(
                     "puntos": eq.get("puntos", 0),
                     "updated_at": datetime.now().isoformat(),
                 })
-            if standings_rows:
-                sb.table("standings").insert(standings_rows).execute()
-            logger.info(f"      🗄️  Supabase: {len(standings_rows)} clasificaciones")
+            # Upsert in-place sobre UNIQUE(group_id, equipo): elimina la ventana vacía del
+            # patrón delete+insert (un fallo entre ambos dejaba el grupo SIN clasificación,
+            # visible para adesa80-web). Luego borra equipos que ya no están en la tabla.
+            sb.table("standings").upsert(standings_rows, on_conflict="group_id,equipo").execute()
+            equipos_actuales = [r["equipo"] for r in standings_rows]
+            if equipos_actuales:
+                sb.table("standings").delete().eq("group_id", group_id).not_.in_(
+                    "equipo", equipos_actuales
+                ).execute()
+            logger.info(f"      🗄️  Supabase: {len(standings_rows)} clasificaciones (upsert)")
         except Exception as e:
             logger.error(f"      ❌ Supabase standings: {e}")
 

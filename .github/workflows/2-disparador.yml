@@ -97,7 +97,7 @@ jobs:
               try:
                   with urllib.request.urlopen(req, timeout=10) as r:
                       matches_hoy = json.loads(r.read())
-                  excluidos = {"cancelado", "aplazado", "esperando_resultado", "finalizado"}
+                  excluidos = {"cancelado", "aplazado", "esperando_resultado", "finalizado", "sin_resultado"}
                   for p in matches_hoy:
                       loc = p.get("local", "").upper()
                       vis = p.get("visitante", "").upper()
@@ -250,7 +250,7 @@ jobs:
 
           pendientes = 0
           detalles = []
-          excluidos = {'cancelado', 'aplazado', 'esperando_resultado', 'finalizado'}
+          excluidos = {'cancelado', 'aplazado', 'esperando_resultado', 'finalizado', 'sin_resultado'}
 
           for m in all_matches:
               loc = m.get('local', '').upper()
