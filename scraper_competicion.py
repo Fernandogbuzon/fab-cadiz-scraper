@@ -39,6 +39,7 @@ import hashlib
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
+from urllib.parse import unquote, urljoin
 
 from dotenv import load_dotenv
 from scraper_common import (
@@ -98,6 +99,7 @@ _CFG = cargar_config()
 TEAM_NAME = _CFG["team_name"]
 TEAM_SLUG = _CFG["team_slug"]
 COMPETICIONES = _CFG["competitions"]
+PROVINCE_BASE_URL = _CFG.get("province_base_url", "").rstrip("/")
 PLAYOFF_FORMATS = _CFG.get("playoff_formats", [])
 # Si True, obtiene las URLs de competiciones desde club_competitions de Supabase
 # en lugar de leerlas de team_config.json.
@@ -537,6 +539,64 @@ def obtener_urls_desde_db() -> list[str]:
     return COMPETICIONES
 
 
+# ─── Resolución de IDs de competición por temporada ──────────────────────────
+
+_RE_COMP_URL = re.compile(r"/delegacion-competicion-(\d+)/([^/?#]+)")
+
+
+def _comp_id_y_slug(url: str) -> tuple[str, str]:
+    """Extrae (id, slug) de una URL de competición. ('', '') si no encaja."""
+    m = _RE_COMP_URL.search(url or "")
+    if not m:
+        return "", ""
+    return m.group(1), unquote(m.group(2)).lower()
+
+
+async def resolver_urls_actuales(page, urls: list[str]) -> list[str]:
+    """Sustituye IDs de competición caducados por los publicados hoy.
+
+    La federación renumera `delegacion-competicion-<id>` cada temporada pero
+    conserva el slug (`comp-copa-andalucia-a`, ...). Sin esto, el scraper deja
+    de funcionar en silencio en cada cambio de temporada. Ante cualquier fallo
+    devolvemos las URLs tal cual: esto es una red de seguridad, no un requisito.
+    """
+    if not PROVINCE_BASE_URL:
+        return urls
+    try:
+        await page.goto(PROVINCE_BASE_URL + "/", wait_until="domcontentloaded", timeout=60000)
+        hrefs = await page.eval_on_selector_all(
+            "a[href*='delegacion-competicion-']",
+            "els => els.map(e => e.getAttribute('href'))",
+        )
+    except Exception as e:
+        logger.warning(f"⚠️ No se pudo leer el índice de competiciones: {e}. Uso URLs del config.")
+        return urls
+
+    vigentes: dict[str, str] = {}
+    for href in hrefs or []:
+        _, slug = _comp_id_y_slug(href or "")
+        if slug:
+            vigentes[slug] = urljoin(PROVINCE_BASE_URL + "/", href)
+
+    if not vigentes:
+        logger.warning("⚠️ Índice sin enlaces de competición. Uso URLs del config.")
+        return urls
+
+    resueltas = []
+    for url in urls:
+        cid, slug = _comp_id_y_slug(url)
+        actual = vigentes.get(slug)
+        if actual and _comp_id_y_slug(actual)[0] != cid:
+            logger.warning(
+                f"🔄 '{slug}': ID {cid} caducado → {_comp_id_y_slug(actual)[0]}. "
+                f"Actualiza team_config.json: {actual}"
+            )
+            resueltas.append(actual)
+        else:
+            resueltas.append(url)
+    return resueltas
+
+
 # ─── Content hashing (detección de cambios) ──────────────────────────────────
 
 def _hash_partidos(partidos: list[dict]) -> str:
@@ -968,14 +1028,23 @@ def carpeta_competicion(nombre: str) -> str:
 
 async def scrape_una_competicion(
     page, url: str, filtro_cat: Optional[str] = None
-) -> tuple[int, str]:
-    """Scrapea una competición completa. Devuelve (total_partidos, comp_carpeta)."""
+) -> tuple[int, str, int, int]:
+    """Scrapea una competición completa.
+    Devuelve (total_partidos, comp_carpeta, grupos_escritos, grupos_saltados)."""
 
     logger.info(f"📡 Navegando a {url}")
     await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+    # La federación redirige a /errores?codigo=404 cuando el ID de competición
+    # ya no existe (renumeración de temporada). Cortamos aquí en vez de esperar
+    # 60 s a un selector que nunca va a aparecer.
+    if "/errores" in (page.url or ""):
+        raise RuntimeError(
+            f"URL caducada: {url} redirige a {page.url}. "
+            "Revisa los IDs de competición en team_config.json."
+        )
     if not await esperar_pagina(page, timeout=60000):
         logger.error("❌ No se pudo cargar la página")
-        return 0, ""
+        return 0, "", 0, 0
     # Esperar a que las categorías tengan opciones (más preciso que pausa fija)
     await esperar_dropdown_con_opciones(page, SEL_CAT)
     await pausa(0.5, 1.2)
@@ -998,7 +1067,7 @@ async def scrape_una_competicion(
 
     if not categorias:
         logger.warning("⚠️ Sin categorías — puede que la página no tenga dropdowns")
-        return 0, comp_carpeta
+        return 0, comp_carpeta, 0, 0
 
     total_partidos = 0
     grupos_scrapeados = 0
@@ -1137,12 +1206,15 @@ async def scrape_todas(
     resultados = []
     run_errors: list = []
     run_status = "completed"
+    todas_fallaron = False
 
-    from urllib.parse import unquote as _unquote
+    # Reconciliar IDs con los vigentes antes de gastar 60 s por URL muerta.
+    urls_base = await resolver_urls_actuales(page, urls_base)
+
     urls_filtradas = []
     for url in urls_base:
         if filtro_comp:
-            slug_decoded = _unquote(url.rstrip("/").split("/")[-1]).lower()
+            slug_decoded = unquote(url.rstrip("/").split("/")[-1]).lower()
             filtro_norm = filtro_comp.lower().replace(" ", "-")
             if filtro_norm not in slug_decoded:
                 continue
@@ -1215,6 +1287,13 @@ async def scrape_todas(
                     f"grupos escritos: {total_groups_scraped} | sin cambios: {total_groups_skipped}")
         logger.info(f"{'═' * 60}")
 
+        # Si TODAS fallaron no es una ejecución correcta: hay que marcarlo en
+        # scraper_runs y salir con código != 0, o el fallo pasa desapercibido
+        # (el workflow seguiría en verde).
+        todas_fallaron = bool(resultados) and all(r[6] for r in resultados)
+        if todas_fallaron:
+            run_status = "failed"
+
     except Exception as e:
         logger.error(f"❌ Error crítico: {e}", exc_info=True)
         run_errors.append({"error": str(e)})
@@ -1231,6 +1310,11 @@ async def scrape_todas(
             matches_upserted=gran_total_partidos,
             errors=run_errors,
         )
+
+    if todas_fallaron:
+        logger.error("❌ Ninguna competición se pudo scrapear. "
+                     "Revisa las URLs de team_config.json / club_competitions.")
+    return todas_fallaron
 
 
 # ─── Modo automático ─────────────────────────────────────────────────────────
@@ -1292,12 +1376,14 @@ def main():
             parallel=args.parallel,
         ))
     else:
-        asyncio.run(scrape_todas(
+        fallo_total = asyncio.run(scrape_todas(
             filtro_comp=args.competicion,
             filtro_cat=args.categoria,
             headless=args.headless,
             parallel=args.parallel,
         ))
+        if fallo_total:
+            sys.exit(1)
 
 
 if __name__ == "__main__":

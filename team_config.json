@@ -5,9 +5,9 @@
   "province_base_url": "https://www.andaluzabaloncesto.org/cadiz",
 
   "competitions": [
-    "https://www.andaluzabaloncesto.org/cadiz/delegacion-competicion-2445/comp-copa-andalucia-a",
-    "https://www.andaluzabaloncesto.org/cadiz/delegacion-competicion-2446/comp-copa-andalucia-b",
-    "https://www.andaluzabaloncesto.org/cadiz/delegacion-competicion-2447/comp-1-a%C3%B1o"
+    "https://www.andaluzabaloncesto.org/cadiz/delegacion-competicion-2740/comp-copa-andalucia-a",
+    "https://www.andaluzabaloncesto.org/cadiz/delegacion-competicion-2741/comp-copa-andalucia-b",
+    "https://www.andaluzabaloncesto.org/cadiz/delegacion-competicion-2742/comp-1-a%C3%B1o"
   ],
 
   "match_duration_hours": 1,
