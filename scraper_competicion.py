@@ -43,8 +43,9 @@ from urllib.parse import unquote, urljoin
 
 from dotenv import load_dotenv
 from scraper_common import (
-    build_match_key,
     build_stable_match_key,
+    competition_storage_slug,
+    seasonal_match_key,
     fecha_iso,
     slugify as _shared_slugify,
 )
@@ -98,6 +99,7 @@ def cargar_config() -> dict:
 _CFG = cargar_config()
 TEAM_NAME = _CFG["team_name"]
 TEAM_SLUG = _CFG["team_slug"]
+SEASON = _CFG["season"]
 COMPETICIONES = _CFG["competitions"]
 PROVINCE_BASE_URL = _CFG.get("province_base_url", "").rstrip("/")
 PLAYOFF_FORMATS = _CFG.get("playoff_formats", [])
@@ -684,13 +686,13 @@ _supports_normalized_match_fields: Optional[bool] = None
 
 def _upsert_competition(sb, comp_nombre: str, comp_carpeta: str, comp_url: str) -> str | None:
     """Asegura que la competición existe. Devuelve su UUID."""
-    cache_key = f"comp:{comp_carpeta}"
+    slug = competition_storage_slug(comp_carpeta, SEASON)
+    cache_key = f"comp:{slug}"
     if cache_key in _entity_cache:
         return _entity_cache[cache_key]
-    slug = comp_carpeta
     try:
         res = sb.table("competitions").upsert(
-            {"slug": slug, "name": comp_nombre, "url": comp_url, "updated_at": datetime.now().isoformat()},
+            {"slug": slug, "season": SEASON, "name": comp_nombre, "url": comp_url, "updated_at": datetime.now().isoformat()},
             on_conflict="slug"
         ).execute()
         result = res.data[0]["id"] if res.data else None
@@ -822,7 +824,7 @@ def guardar_supabase(
             continue
 
         # match_key: fecha + equipos ordenados + categoría (dedup)
-        match_key = build_match_key(p.get("fecha", ""), loc, vis, cat)
+        match_key = seasonal_match_key(SEASON, comp_carpeta, p.get("fecha", ""), loc, vis, cat)
 
         estado = "finalizado" if p.get("es_resultado") else "proximo"
         # Si ya existe, preferir la versión con resultado
@@ -841,7 +843,7 @@ def guardar_supabase(
             "local_slug": slugify(loc),
             "visitante_slug": slugify(vis),
             "stable_match_key": build_stable_match_key(
-                comp_carpeta,
+                competition_storage_slug(comp_carpeta, SEASON),
                 cat,
                 fase,
                 grupo,

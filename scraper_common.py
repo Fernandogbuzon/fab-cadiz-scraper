@@ -73,6 +73,23 @@ def build_stable_match_key(
     return "_".join(p for p in parts if p)
 
 
+def competition_storage_slug(base_slug: str, season: str) -> str:
+    """Identidad de una competición por temporada, sin reutilizar la histórica."""
+    if not re.fullmatch(r"\d{4}-\d{4}", season):
+        raise ValueError("season debe tener formato YYYY-YYYY")
+    start, end = map(int, season.split("-"))
+    if end != start + 1:
+        raise ValueError("season debe abarcar dos años consecutivos")
+    return f"{slugify(base_slug)}-{season}"
+
+
+def seasonal_match_key(
+    season: str, competition_slug: str, fecha: str, local: str, visitante: str, categoria: str
+) -> str:
+    """Evita que un partido nuevo sobrescriba otro de una temporada anterior."""
+    return f"{season}_{slugify(competition_slug)}_{build_match_key(fecha, local, visitante, categoria)}"
+
+
 def build_lookup_key(fecha: str, local: str, visitante: str) -> str:
     """Canonical lookup key for matching web rows to DB rows."""
     return f"{fecha_key(fecha)}_{equipos_key(local, visitante)}"

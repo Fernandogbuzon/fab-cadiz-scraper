@@ -4,6 +4,8 @@ from scraper_common import (
     build_lookup_key,
     build_match_key,
     build_stable_match_key,
+    competition_storage_slug,
+    seasonal_match_key,
     fecha_iso,
     fecha_key,
     legacy_fecha_key,
@@ -13,6 +15,18 @@ from scraper_common import (
 
 
 class ScraperCommonTests(unittest.TestCase):
+    def test_seasonal_keys_preserve_history(self):
+        self.assertEqual(
+            competition_storage_slug("copa-andalucia-a", "2026-2027"),
+            "copa-andalucia-a-2026-2027",
+        )
+        old = build_match_key("21/09/2026", "ADESA 80", "CB Cadiz", "Junior Masculino")
+        new = seasonal_match_key("2026-2027", "copa-andalucia-a", "21/09/2026", "ADESA 80", "CB Cadiz", "Junior Masculino")
+        self.assertNotEqual(new, old)
+        self.assertNotEqual(new, seasonal_match_key("2026-2027", "copa-andalucia-b", "21/09/2026", "ADESA 80", "CB Cadiz", "Junior Masculino"))
+        with self.assertRaises(ValueError):
+            competition_storage_slug("copa", "2026-2028")
+
     def test_slugify_removes_accents_and_noise(self):
         self.assertEqual(slugify("Copa Andalucia B"), "copa-andalucia-b")
         self.assertEqual(slugify("1 Ano / Cadiz"), "1-ano-cadiz")
