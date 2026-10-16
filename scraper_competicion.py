@@ -36,7 +36,7 @@ import random
 import logging
 import unicodedata
 import hashlib
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 from urllib.parse import unquote, urljoin
@@ -283,10 +283,16 @@ async def seleccionar_dropdown(page, selector: str, ddl_name: str, value: str, m
     """Selecciona valor en dropdown y espera la navegación del postback ASP.NET."""
     for intento in range(max_retries):
         try:
-            await page.evaluate("() => { window.__cFRLUnblockHandlers = true; }")
-            
             # Esperar a que el selector esté disponible
             await page.wait_for_selector(selector, timeout=10000, state="visible")
+
+            # La primera opción y los filtros con una única opción ya suelen
+            # estar seleccionados. Evitar select_option ahorra un postback
+            # redundante, o su timeout de 90 s si la página no navega.
+            if await page.locator(selector).input_value() == value:
+                return True
+
+            await page.evaluate("() => { window.__cFRLUnblockHandlers = true; }")
             
             # Intentar selección con navegación
             try:
@@ -608,29 +614,33 @@ def _hash_partidos(partidos: list[dict]) -> str:
         [{k: p.get(k) for k in key_fields} for p in partidos],
         key=lambda p: (p.get("fecha", ""), p.get("local", ""), p.get("visitante", ""))
     )
-    return hashlib.sha256(json.dumps(normalized, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+    # Version 2 invalidates hashes recorded before writes finished in older runs.
+    payload = {"version": 2, "partidos": normalized}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 
 def _grupo_sin_cambios(sb, group_id: str, new_hash: str) -> bool:
-    """
-    Retorna True si el hash del grupo no cambió respecto al último scrape.
-
-    Usa la RPC atómica check_content_changed (INSERT ... ON CONFLICT en una sola
-    sentencia) en vez de un select-then-update/insert, que tenía una carrera entre
-    ejecuciones solapadas (cron calendario + disparador) capaz de duplicar el hash.
-    La RPC devuelve True si CAMBIÓ (y actualiza el hash); aquí invertimos a "sin cambios".
-    """
+    """Compare only with a successfully persisted group; never advance its hash."""
     try:
-        res = sb.rpc("check_content_changed", {
+        res = sb.table("content_hashes").select("content_hash").eq(
+            "entity_type", "group"
+        ).eq("entity_id", group_id).limit(1).execute()
+        return bool(res.data and res.data[0].get("content_hash") == new_hash)
+    except Exception as e:
+        logger.warning(f"      ⚠️ content_hashes read error: {e}")
+        return False  # En caso de error, proceder con upsert normal
+
+
+def _guardar_hash(sb, group_id: str, new_hash: str):
+    """Stamp after every write succeeds; a stamp failure only repeats safe writes."""
+    try:
+        sb.rpc("check_content_changed", {
             "p_entity_type": "group",
             "p_entity_id": group_id,
             "p_new_hash": new_hash,
         }).execute()
-        changed = bool(res.data)
-        return not changed
     except Exception as e:
-        logger.warning(f"      ⚠️ content_hashes RPC error: {e}")
-        return False  # En caso de error, proceder con upsert normal
+        logger.warning(f"      ⚠️ No se pudo guardar content_hashes: {e}")
 
 
 # ─── scraper_runs: registro de ejecuciones ───────────────────────────────────
@@ -669,7 +679,7 @@ def _run_finalizar(run_id: Optional[str], status: str, comps: int,
             "groups_skipped": groups_skipped,
             "matches_upserted": matches_upserted,
             "errors": errors,
-            "finished_at": datetime.now().isoformat(),
+            "finished_at": datetime.now(timezone.utc).isoformat(),
         }).eq("id", run_id).execute()
     except Exception as e:
         logger.warning(f"  ⚠️ No se pudo actualizar scraper_run: {e}")
@@ -692,7 +702,7 @@ def _upsert_competition(sb, comp_nombre: str, comp_carpeta: str, comp_url: str) 
         return _entity_cache[cache_key]
     try:
         res = sb.table("competitions").upsert(
-            {"slug": slug, "season": SEASON, "name": comp_nombre, "url": comp_url, "updated_at": datetime.now().isoformat()},
+            {"slug": slug, "season": SEASON, "name": comp_nombre, "url": comp_url, "updated_at": datetime.now(timezone.utc).isoformat()},
             on_conflict="slug"
         ).execute()
         result = res.data[0]["id"] if res.data else None
@@ -856,7 +866,7 @@ def guardar_supabase(
             "pabellon": p.get("pabellon", ""),
             "es_resultado": p.get("es_resultado", False),
             "estado": estado,
-            "updated_at": datetime.now().isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
         }
 
     # ── Detectar series ya cerradas en fases playoff para eliminar ghost games ──
@@ -915,31 +925,42 @@ def guardar_supabase(
     current_keys = set(matches_dict.keys())
 
     if matches_to_upsert:
-        # Preservar estados 'terminales' (esperando_resultado, aplazado, cancelado)
-        # para que el scraper completo diario no reestablezca "proximo" y cause un bucle infinito
+        # Un horario nuevo necesita un presupuesto nuevo de consultas, incluso
+        # si se ha adelantado. La cancelación explícita siempre se conserva.
         TERMINAL_ESTADOS = {"esperando_resultado", "aplazado", "cancelado"}
+        horarios_cambiados = set()
         keys_sin_resultado = [m["match_key"] for m in matches_to_upsert if not m.get("es_resultado")]
         if keys_sin_resultado:
             try:
-                ex_res = sb.table("matches").select("match_key, estado").in_("match_key", keys_sin_resultado).execute()
-                preserved_estados = {
-                    r["match_key"]: r["estado"]
-                    for r in (ex_res.data or [])
-                    if r.get("estado") in TERMINAL_ESTADOS
-                }
-                if preserved_estados:
-                    logger.info(f"      🔒 Preservando {len(preserved_estados)} estado(s) terminal(es)")
-                    for mdu in matches_to_upsert:
-                        if not mdu.get("es_resultado") and mdu["match_key"] in preserved_estados:
-                            mdu["estado"] = preserved_estados[mdu["match_key"]]
+                previous = {}
+                for i in range(0, len(keys_sin_resultado), 50):
+                    ex_res = sb.table("matches").select("match_key, estado, hora").in_(
+                        "match_key", keys_sin_resultado[i:i + 50]
+                    ).execute()
+                    previous.update({r["match_key"]: r for r in (ex_res.data or [])})
+                for match in matches_to_upsert:
+                    old = previous.get(match["match_key"])
+                    if not old:
+                        continue
+                    changed = (old.get("hora") or "").strip() != (match.get("hora") or "").strip()
+                    if changed:
+                        horarios_cambiados.add(match["match_key"])
+                    if old.get("estado") in TERMINAL_ESTADOS and (not changed or old["estado"] == "cancelado"):
+                        match["estado"] = old["estado"]
             except Exception as e:
-                logger.warning(f"      ⚠️ No se pudo preservar estados terminales: {e}")
+                raise RuntimeError("No se pudieron comprobar los horarios anteriores") from e
 
+        # Limpiar antes del upsert: si este falla, repetirlo sigue siendo seguro
+        # y no perdemos la evidencia del horario anterior para reiniciar consultas.
+        changed_keys = sorted(horarios_cambiados)
+        for i in range(0, len(changed_keys), 50):
+            sb.table("scraper_retries").delete().in_("match_key", changed_keys[i:i + 50]).execute()
         try:
             _upsert_matches_batch(sb, matches_to_upsert)
             logger.info(f"      🗄️  Supabase: {len(matches_to_upsert)} partidos")
         except Exception as e:
             logger.error(f"      ❌ Supabase upsert matches: {e}")
+            raise
 
     # ── Limpiar partidos obsoletos de este grupo ──────────────────────────────
     # Elimina: matches con fecha cambiada por la federación (Issue 3),
@@ -957,6 +978,7 @@ def guardar_supabase(
             logger.info(f"      🗄️  Supabase: eliminados {len(stale_keys)} partidos obsoletos {list(stale_keys)[:3]}")
     except Exception as e:
         logger.error(f"      ❌ Supabase cleanup matches: {e}")
+        raise
 
     # 5. Clasificaciones – reemplazar por group_id
     clasif_data = clasif.get("clasificacion", [])
@@ -975,7 +997,7 @@ def guardar_supabase(
                     "puntos_contra": eq.get("puntos_contra", 0),
                     "diferencia": eq.get("diferencia", 0),
                     "puntos": eq.get("puntos", 0),
-                    "updated_at": datetime.now().isoformat(),
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
                 })
             # Upsert in-place sobre UNIQUE(group_id, equipo): elimina la ventana vacía del
             # patrón delete+insert (un fallo entre ambos dejaba el grupo SIN clasificación,
@@ -989,7 +1011,9 @@ def guardar_supabase(
             logger.info(f"      🗄️  Supabase: {len(standings_rows)} clasificaciones (upsert)")
         except Exception as e:
             logger.error(f"      ❌ Supabase standings: {e}")
+            raise
 
+    _guardar_hash(sb, group_id, nuevo_hash)
     return True
 
 
@@ -1045,8 +1069,7 @@ async def scrape_una_competicion(
             "Revisa los IDs de competición en team_config.json."
         )
     if not await esperar_pagina(page, timeout=60000):
-        logger.error("❌ No se pudo cargar la página")
-        return 0, "", 0, 0
+        raise RuntimeError(f"No se pudo cargar la página de competición: {url}")
     # Esperar a que las categorías tengan opciones (más preciso que pausa fija)
     await esperar_dropdown_con_opciones(page, SEL_CAT)
     await pausa(0.5, 1.2)
@@ -1068,8 +1091,7 @@ async def scrape_una_competicion(
         logger.info(f"   - {c['text']}")
 
     if not categorias:
-        logger.warning("⚠️ Sin categorías — puede que la página no tenga dropdowns")
-        return 0, comp_carpeta, 0, 0
+        raise RuntimeError(f"La competición no tiene categorías disponibles: {url}")
 
     total_partidos = 0
     grupos_scrapeados = 0
@@ -1208,7 +1230,6 @@ async def scrape_todas(
     resultados = []
     run_errors: list = []
     run_status = "completed"
-    todas_fallaron = False
 
     # Reconciliar IDs con los vigentes antes de gastar 60 s por URL muerta.
     urls_base = await resolver_urls_actuales(page, urls_base)
@@ -1289,11 +1310,9 @@ async def scrape_todas(
                     f"grupos escritos: {total_groups_scraped} | sin cambios: {total_groups_skipped}")
         logger.info(f"{'═' * 60}")
 
-        # Si TODAS fallaron no es una ejecución correcta: hay que marcarlo en
-        # scraper_runs y salir con código != 0, o el fallo pasa desapercibido
-        # (el workflow seguiría en verde).
-        todas_fallaron = bool(resultados) and all(r[6] for r in resultados)
-        if todas_fallaron:
+        # Conservar el progreso de las otras competiciones, haciendo visible
+        # cualquier fallo parcial tanto en scraper_runs como en el workflow.
+        if run_errors:
             run_status = "failed"
 
     except Exception as e:
@@ -1313,10 +1332,9 @@ async def scrape_todas(
             errors=run_errors,
         )
 
-    if todas_fallaron:
-        logger.error("❌ Ninguna competición se pudo scrapear. "
-                     "Revisa las URLs de team_config.json / club_competitions.")
-    return todas_fallaron
+    if run_errors:
+        logger.error(f"❌ {len(run_errors)} competición(es) con errores; revisa el registro de ejecución.")
+    return bool(run_errors)
 
 
 # ─── Modo automático ─────────────────────────────────────────────────────────

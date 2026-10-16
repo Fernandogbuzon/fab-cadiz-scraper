@@ -1,298 +1,50 @@
 name: "2. Resultados - Detectar y scrapear"
 
-# ARQUITECTURA DE 2 FASES:
-#
-# JOB 1 — pre-check (siempre, ~3s, SIN checkout):
-#   Consulta Supabase REST API para ver si hay partidos HOY dentro de la ventana util
-#   (30 min antes del fin del partido hasta 60 min despues) o hay reintentos
-#   activos recientes.
-#   → Dias sin partido: ~3s en lugar de ~14s. Ahorro ~80% en dias vacios.
-#
-# JOB 2 — detectar-y-scrapear (solo si pre-check da luz verde):
-#   FASE 2a (ligera): solo lee JSONs locales, sin navegador
-#   FASE 2b (solo si hay pendientes): Playwright + scraper_resultados.py
-#
-# IMPORTANTE: TZ=Europe/Madrid para que datetime.now() compare
-# correctamente con las horas de los partidos (hora espanola)
-
+# El precheck comparte la política de reintentos con el scraper y usa solo stdlib.
+# Solo se instala Python/dependencias/navegador si hay consultas pendientes.
 on:
   schedule:
-    # Sabado y Domingo: cada 20 min, 8:00-23:40 Espana
-    - cron: '*/20 6-22 * * 0,6'
-    # Viernes: cada 20 min, 16:00-00:00 Espana
-    - cron: '*/20 14-23 * * 5'
-    # Lunes-Jueves: cada 30 min, 17:00-23:00 Espana
-    - cron: '*/30 15-22 * * 1-4'
+    - cron: '7-59/10 7-23,0-1 * * *'
+      timezone: Europe/Madrid
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: scraper-escritura
+  queue: max
   cancel-in-progress: false
 
 jobs:
-  # ── JOB 1: Pre-check sin checkout (~3s) ─────────────────────────────────────
-  pre-check:
-    runs-on: ubuntu-latest
-    timeout-minutes: 2
-    outputs:
-      run: ${{ steps.check.outputs.run }}
-    env:
-      TZ: Europe/Madrid
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-    steps:
-      - name: Verificar si hay partidos hoy o reintentos activos
-        id: check
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CENTRAL_SUPABASE_URL: ${{ secrets.CENTRAL_SUPABASE_URL }}
-          CENTRAL_SUPABASE_SERVICE_KEY: ${{ secrets.CENTRAL_SUPABASE_SERVICE_KEY }}
-        run: |
-          python3 << 'PYEOF'
-          import urllib.request, json, os, urllib.parse
-          from datetime import datetime, timedelta
-
-          token = os.environ["GITHUB_TOKEN"]
-          repo  = os.environ["GITHUB_REPOSITORY"]
-          SUPABASE_URL = os.environ.get("CENTRAL_SUPABASE_URL", "").strip()
-          SUPABASE_KEY = os.environ.get("CENTRAL_SUPABASE_SERVICE_KEY", "").strip()
-          ahora = datetime.now()   # TZ=Europe/Madrid ya aplicado
-          hoy   = ahora.strftime("%d/%m/%Y")
-
-          def get_raw(path):
-              url = f"https://raw.githubusercontent.com/{repo}/main/{path}"
-              req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
-              try:
-                  with urllib.request.urlopen(req, timeout=10) as r:
-                      return json.loads(r.read())
-              except Exception as e:
-                  print(f"  [warn] No se pudo leer {path}: {e}")
-                  return None
-
-          print(f"Hora Espana: {ahora.strftime('%d/%m/%Y %H:%M')}")
-
-          # Leer config del equipo para filtro y duracion
-          team_cfg = get_raw("team_config.json") or {}
-          TEAM_FIRST = (team_cfg.get("team_name", "ADESA") or "ADESA").split()[0].upper()
-          DURACION_H = team_cfg.get("match_duration_hours", 1)
-          MAX_RETRIES = team_cfg.get("max_retry_attempts", 5)
-
-          # 1. Partidos del equipo hoy con ventana de tiempo util (consulta Supabase):
-          #    activa desde 30 min antes del fin hasta 180 min despues (3h).
-          #    Si el partido ya paso sin resultado, activar todo el dia.
-          #    Si no tiene hora conocida, activar todo el dia.
-          en_ventana = []
-          if SUPABASE_URL and SUPABASE_KEY:
-              hoy_enc = urllib.parse.quote_plus(hoy)
-              api_url = (f"{SUPABASE_URL}/rest/v1/matches"
-                         f"?select=fecha,hora,estado,local,visitante"
-                         f"&es_resultado=eq.false"
-                         f"&fecha=eq.{hoy_enc}")
-              req = urllib.request.Request(
-                  api_url,
-                  headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
-              )
-              try:
-                  with urllib.request.urlopen(req, timeout=10) as r:
-                      matches_hoy = json.loads(r.read())
-                  excluidos = {"cancelado", "aplazado", "esperando_resultado", "finalizado", "sin_resultado"}
-                  for p in matches_hoy:
-                      loc = p.get("local", "").upper()
-                      vis = p.get("visitante", "").upper()
-                      if TEAM_FIRST not in loc and TEAM_FIRST not in vis:
-                          continue
-                      estado = p.get("estado", "")
-                      if estado in excluidos:
-                          continue
-                      hora = p.get("hora", "")
-                      if hora and ":" in hora:
-                          h, mi = hora.split(":")
-                          inicio = ahora.replace(hour=int(h), minute=int(mi), second=0, microsecond=0)
-                          fin    = inicio + timedelta(hours=DURACION_H)
-                          if fin - timedelta(minutes=30) <= ahora <= fin + timedelta(minutes=180):
-                              en_ventana.append(p)
-                          elif ahora > fin + timedelta(minutes=180) and estado not in ("finalizado", "aplazado"):
-                              en_ventana.append(p)
-                              print(f"  (sin resultado tardio) {hora}")
-                          elif ahora < fin - timedelta(minutes=30):
-                              print(f"  (proximo) {hora}")
-                      else:
-                          en_ventana.append(p)
-              except Exception as e:
-                  print(f"  [warn] Error consultando Supabase: {e}. Asumiendo partido posible.")
-                  en_ventana.append({"hora": "?", "categoria": "fallback"})
-          else:
-              print("  [warn] Supabase no configurado. Asumiendo partido posible.")
-              en_ventana.append({"hora": "?", "categoria": "fallback"})
-
-          # 2. Reintentos activos en las ultimas 6 horas (ventana max: 5*10min + margen amplio)
-          intentos_data = get_raw("intentos_resultados.json") or {}
-          active_retries = []
-          for k, v in intentos_data.items():
-              try:
-                  ultimo = datetime.fromisoformat(v.get("ultimo", "2000-01-01"))
-                  mins   = (ahora - ultimo).total_seconds() / 60
-                  if v.get("intentos", 0) < MAX_RETRIES and mins < 360:
-                      active_retries.append(k)
-              except Exception:
-                  pass
-
-          # 2b. Reintentos activos en Supabase. El scraper escribe aqui cuando
-          #     CENTRAL_SUPABASE_* esta configurado; el JSON local es solo fallback.
-          if SUPABASE_URL and SUPABASE_KEY:
-              cutoff = (ahora - timedelta(hours=6)).isoformat()
-              cutoff_enc = urllib.parse.quote_plus(cutoff)
-              retries_url = (f"{SUPABASE_URL}/rest/v1/scraper_retries"
-                             f"?select=match_key,intento,ultimo"
-                             f"&ultimo=gt.{cutoff_enc}"
-                             f"&intento=lt.{MAX_RETRIES}")
-              req = urllib.request.Request(
-                  retries_url,
-                  headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
-              )
-              try:
-                  with urllib.request.urlopen(req, timeout=10) as r:
-                      retries_db = json.loads(r.read())
-                  for row in retries_db:
-                      mk = row.get("match_key")
-                      if mk and mk not in active_retries:
-                          active_retries.append(mk)
-              except Exception as e:
-                  print(f"  [warn] Error consultando scraper_retries: {e}. Usando JSON local.")
-
-          run = len(en_ventana) > 0 or len(active_retries) > 0
-
-          print(f"Partidos en ventana activa: {len(en_ventana)}")
-          for p in en_ventana:
-              print(f"  {p.get('hora','?')} - {p.get('local','?')} vs {p.get('visitante','?')}")
-          print(f"Reintentos activos (<6h): {len(active_retries)}")
-          print(f"→ Lanzar scraper: {run}")
-
-          with open(os.environ.get("GITHUB_OUTPUT", "/dev/null"), "a") as f:
-              f.write(f"run={'true' if run else 'false'}\n")
-          PYEOF
-
-  # ── JOB 2: Scraping (solo si pre-check da luz verde) ─────────────────────
   detectar-y-scrapear:
-    needs: pre-check
-    if: needs.pre-check.outputs.run == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 15
     env:
       TZ: Europe/Madrid
+      SCRAPER_PENDING_FILE: .scraper-pending.json
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          ref: main
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-          cache: 'pip'
 
       - name: Comprobar partidos pendientes
         id: check
         env:
           CENTRAL_SUPABASE_URL: ${{ secrets.CENTRAL_SUPABASE_URL }}
           CENTRAL_SUPABASE_SERVICE_KEY: ${{ secrets.CENTRAL_SUPABASE_SERVICE_KEY }}
-        run: |
-          python -c "
-          import urllib.request, urllib.parse, json, sys, os
-          from pathlib import Path
-          from datetime import datetime, timedelta
+        run: python3 scraper_precheck.py
 
-          SUPABASE_URL = os.environ.get('CENTRAL_SUPABASE_URL', '').strip()
-          SUPABASE_KEY = os.environ.get('CENTRAL_SUPABASE_SERVICE_KEY', '').strip()
-
-          cfg = json.loads(Path('team_config.json').read_text())
-          TEAM_FIRST = cfg['team_name'].split()[0].upper()
-          DURATION = cfg.get('match_duration_hours', 1)
-          MAX = cfg.get('max_retry_attempts', 5)
-
-          ahora = datetime.now()
-          print(f'Hora actual (Espana): {ahora.strftime(\"%d/%m/%Y %H:%M\")}')
-
-          intentos = {}
-          intentos_file = Path('intentos_resultados.json')
-          if intentos_file.exists():
-              try:
-                  intentos = json.loads(intentos_file.read_text())
-                  intentos = {k:v for k,v in intentos.items()
-                              if (ahora - datetime.fromisoformat(v.get('ultimo','2000-01-01'))).total_seconds() < 48*3600}
-              except: pass
-
-          if not SUPABASE_URL or not SUPABASE_KEY:
-              print('[warn] Supabase no configurado. Asumiendo sin pendientes.')
-              with open(os.environ.get('GITHUB_OUTPUT', '/dev/null'), 'a') as f:
-                  f.write('pendientes=false\nnum=0\n')
-              sys.exit(0)
-
-          api_url = (f'{SUPABASE_URL}/rest/v1/matches'
-                     f'?select=match_key,fecha,hora,estado,local,visitante'
-                     f'&es_resultado=eq.false')
-          headers_sb = {'apikey': SUPABASE_KEY, 'Authorization': f'Bearer {SUPABASE_KEY}'}
-          try:
-              req = urllib.request.Request(api_url, headers=headers_sb)
-              with urllib.request.urlopen(req, timeout=15) as r:
-                  all_matches = json.loads(r.read())
-          except Exception as e:
-              print(f'Error consultando Supabase: {e}. Asumiendo sin pendientes.')
-              with open(os.environ.get('GITHUB_OUTPUT', '/dev/null'), 'a') as f:
-                  f.write('pendientes=false\nnum=0\n')
-              sys.exit(0)
-
-          pendientes = 0
-          detalles = []
-          excluidos = {'cancelado', 'aplazado', 'esperando_resultado', 'finalizado', 'sin_resultado'}
-
-          for m in all_matches:
-              loc = m.get('local', '').upper()
-              vis = m.get('visitante', '').upper()
-              if TEAM_FIRST not in loc and TEAM_FIRST not in vis:
-                  continue
-              if m.get('estado', '') in excluidos:
-                  continue
-              fecha = m.get('fecha', '')
-              hora = m.get('hora', '')
-              pid = m.get('match_key', '')
-              if not fecha or not pid:
-                  continue
-              try:
-                  d,mo,y = fecha.split('/')
-                  dt = datetime(int(y),int(mo),int(d))
-                  if hora and ':' in hora:
-                      h,mi = hora.split(':')
-                      dt = dt.replace(hour=int(h),minute=int(mi))
-                  else:
-                      dt = dt.replace(hour=12)
-              except: continue
-              dt_fin = dt + timedelta(hours=DURATION)
-              if dt_fin >= ahora: continue
-              n = intentos.get(pid,{}).get('intentos',0)
-              if n >= MAX: continue
-              pendientes += 1
-              mins = int((ahora - dt_fin).total_seconds() / 60)
-              detalles.append(f'  [{n+1}/{MAX}] {m.get(\"local\",\"?\")} vs {m.get(\"visitante\",\"?\")} ({fecha} {hora}) - hace {mins}min')
-
-          print(f'Pendientes: {pendientes}')
-          for d in detalles:
-              print(d)
-
-          with open(os.environ.get('GITHUB_OUTPUT','/dev/null'), 'a') as f:
-              f.write(f'pendientes={\"true\" if pendientes > 0 else \"false\"}\n')
-              f.write(f'num={pendientes}\n')
-          "
+      - name: Setup Python
+        if: steps.check.outputs.pendientes == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
 
       - name: Cache Playwright
         if: steps.check.outputs.pendientes == 'true'
-        id: cache-pw
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
@@ -302,84 +54,28 @@ jobs:
         if: steps.check.outputs.pendientes == 'true'
         run: |
           pip install -r requirements.txt
-          playwright install chromium
-          if [ "${{ steps.cache-pw.outputs.cache-hit }}" != "true" ]; then
-            playwright install-deps chromium
-          else
-            sudo apt-get install -y xvfb > /dev/null 2>&1
-          fi
+          playwright install --with-deps chromium
 
       - name: Scraping de resultados
         if: steps.check.outputs.pendientes == 'true'
-        id: scrape
         env:
           CENTRAL_SUPABASE_URL: ${{ secrets.CENTRAL_SUPABASE_URL }}
           CENTRAL_SUPABASE_SERVICE_KEY: ${{ secrets.CENTRAL_SUPABASE_SERVICE_KEY }}
         run: |
-          echo "=== Scrapeando ${{ steps.check.outputs.num }} resultado(s) pendiente(s) ==="
-
-          OUTPUT=$(xvfb-run --auto-servernum --server-args="-screen 0 1366x768x24" \
-            python scraper_resultados.py 2>&1) || true
-
-          echo "$OUTPUT"
-
-          if echo "$OUTPUT" | grep -q "RESULTADO:"; then
-            echo "actualizados=true" >> $GITHUB_OUTPUT
-          else
-            echo "actualizados=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Commit y push
-        if: steps.check.outputs.pendientes == 'true'
-        run: |
-          git config --local user.name "GitHub Actions Bot"
-          git config --local user.email "actions@github.com"
-
-          echo "Sincronizando con remoto..."
-          git pull --rebase origin main || {
-            echo "Rebase fallido, resolviendo..."
-            git rebase --abort 2>/dev/null || true
-            git pull origin main --no-rebase || true
-          }
-
-          git add intentos_resultados.json 2>/dev/null || true
-
-          if git diff --cached --quiet; then
-            echo "Sin cambios que commitear"
-          else
-            TIMESTAMP=$(date '+%d/%m/%Y %H:%M')
-
-            if [ "${{ steps.scrape.outputs.actualizados }}" = "true" ]; then
-              MSG="Resultados actualizados - ${TIMESTAMP}"
-            else
-              MSG="Actualizar intentos - ${TIMESTAMP}"
-            fi
-
-            git commit -m "${MSG}"
-
-            for intento in 1 2 3; do
-              if git push origin main; then
-                echo "Push exitoso (intento $intento)"
-                break
-              fi
-              echo "Push fallido (intento $intento/3), reintentando en 5s..."
-              sleep 5
-              git pull --rebase origin main || {
-                echo "Rebase con conflicto, haciendo abort + merge..."
-                git rebase --abort 2>/dev/null || true
-                git pull origin main --no-rebase || true
-              }
-              if [ "$intento" -eq 3 ]; then
-                echo "::error::No se pudo hacer push tras 3 intentos"
-                exit 1
-              fi
-            done
-          fi
+          set -o pipefail
+          xvfb-run --auto-servernum --server-args="-screen 0 1366x768x24" \
+            python scraper_resultados.py 2>&1 | tee resultados.log
 
       - name: Resumen
         if: always()
         run: |
-          echo "### Resultados" >> $GITHUB_STEP_SUMMARY
-          echo "**Hora Espana:** $(date '+%H:%M')" >> $GITHUB_STEP_SUMMARY
-          echo "**Pendientes:** ${{ steps.check.outputs.num || 0 }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Resultados nuevos:** ${{ steps.scrape.outputs.actualizados || 'n/a' }}" >> $GITHUB_STEP_SUMMARY
+          echo "### Resultados" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Hora España:** $(date '+%d/%m/%Y %H:%M')" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Estado:** ${{ job.status }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Partidos pendientes:** ${{ steps.check.outputs.num || '0' }}" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f resultados.log ]; then
+            RESULT_COUNT=$(sed -n 's/^RESULT_COUNT=\([0-9][0-9]*\)$/\1/p' resultados.log | tail -n 1)
+            echo "**Resultados nuevos:** ${RESULT_COUNT:-no disponible}" >> "$GITHUB_STEP_SUMMARY"
+          elif [ "${{ steps.check.outcome }}" = "success" ] && [ "${{ steps.check.outputs.pendientes }}" = "false" ]; then
+            echo "No hay consultas pendientes; no se ha instalado ni iniciado el navegador." >> "$GITHUB_STEP_SUMMARY"
+          fi
