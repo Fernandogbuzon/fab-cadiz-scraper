@@ -10,9 +10,12 @@
     "https://www.andaluzabaloncesto.org/cadiz/delegacion-competicion-XXXX/nombre-competicion"
   ],
 
-  "match_duration_hours": 2.5,
-  "max_retry_attempts": 3,
+  "match_duration_hours": 1,
+  "max_retry_attempts": 11,
   "retry_interval_minutes": 10,
+  "retry_poll_grace_seconds": 180,
+  "retry_intervals_minutes": [10, 10, 10, 10, 20, 30, 60, 120, 240],
+  "retry_window_hours": 24,
   "watch_all_clubs": false,
   "competitions_from_db": false
 }

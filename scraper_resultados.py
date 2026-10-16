@@ -6,13 +6,10 @@ Detecta partidos del equipo configurado en team_config.json que deberían
 haber terminado (hora inicio + duración) pero aún no tienen resultado,
 y scrapea SOLO esos grupos específicos.
 
-Lógica de reintentos (max configurable):
-  - Intento 1: hora_partido + duración
-  - Intento 2: +10 min (llamado de nuevo por el disparador)
-  - Intento 3: +10 min más
-  - Si al último intento no hay resultado, se rinde (aplazado/no jugado)
-
-Estado de intentos guardado en intentos_resultados.json
+Primera consulta: hora programada + duración. Reintentos rápidos al principio
+y espaciados después, compartidos con scraper_precheck.py. Los fallos técnicos
+no consumen intentos y agotar el presupuesto nunca implica un aplazamiento.
+Estado persistente en Supabase; JSON solo para ejecuciones locales sin CI.
 
 Uso:
   python scraper_resultados.py                # Una pasada (scraping)
@@ -25,7 +22,6 @@ import asyncio
 import json
 import re
 import sys
-import io
 import os
 import argparse
 import random
@@ -38,6 +34,8 @@ from typing import Optional
 
 from dotenv import load_dotenv
 from scraper_common import build_lookup_key, fecha_key, parse_fecha_hora, slugify as _shared_slugify
+from scraper_schedule import MADRID, pending_matches, utc_now
+from scraper_precheck import load_context
 
 # Cargar .env
 load_dotenv(Path(__file__).parent / ".env")
@@ -87,7 +85,7 @@ _CFG = cargar_config()
 TEAM_NAME = _CFG["team_name"]
 TEAM_SLUG = _CFG["team_slug"]
 DURACION_PARTIDO_HORAS = _CFG.get("match_duration_hours", 1)
-MAX_INTENTOS = _CFG.get("max_retry_attempts", 5)
+MAX_INTENTOS = _CFG.get("max_retry_attempts", 11)
 RETRY_INTERVAL_MIN = _CFG.get("retry_interval_minutes", 10)
 # Si True, monitoriza partidos de TODOS los clubes (no solo TEAM_NAME).
 # Útil cuando el scraper gestiona múltiples clubes a la vez.
@@ -116,8 +114,9 @@ USER_AGENTS = [
 
 # Fix Windows console encoding
 if sys.platform == 'win32':
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -132,56 +131,36 @@ logger = logging.getLogger(__name__)
 
 # ─── Estado de intentos (respaldado en Supabase scraper_retries) ─────────────
 
-def cargar_intentos() -> dict:
-    """
-    Carga el estado de reintentos desde Supabase (tabla scraper_retries).
-    Fallback a JSON local si Supabase no está disponible.
-    Formato devuelto: { "match_key": { "intentos": N, "ultimo": "ISO" } }
+_intentos_iniciales: dict = {}
+
+
+def guardar_intentos(intentos: dict, resueltos: set[str] | None = None):
+    """Write changed retries and remove resolved ones, including an empty state.
+
+    A CI persistence failure must fail the run: an ephemeral JSON fallback would
+    silently reset the budget on the next runner.
     """
     sb = get_supabase()
+    eliminados = (set(_intentos_iniciales) - set(intentos)) | (resueltos or set())
     if sb:
-        try:
-            cutoff = (datetime.now() - timedelta(hours=48)).isoformat()
-            res = sb.table("scraper_retries").select("match_key, intento, ultimo").gt("ultimo", cutoff).execute()
-            return {
-                r["match_key"]: {"intentos": r["intento"], "ultimo": r["ultimo"]}
-                for r in (res.data or [])
-            }
-        except Exception as e:
-            logger.warning(f"  ⚠️ No se pudo leer scraper_retries de DB: {e}. Usando JSON local.")
-
-    # Fallback: JSON local
-    if INTENTOS_FILE.exists():
-        try:
-            data = json.loads(INTENTOS_FILE.read_text(encoding="utf-8"))
-            ahora = datetime.now()
-            return {
-                pid: info for pid, info in data.items()
-                if (ahora - datetime.fromisoformat(info.get("ultimo", "2000-01-01"))).total_seconds() < 48 * 3600
-            }
-        except Exception:
-            return {}
-    return {}
-
-
-def guardar_intentos(intentos: dict):
-    """
-    Persiste el estado de reintentos en Supabase (scraper_retries).
-    Fallback a JSON local si Supabase no está disponible.
-    """
-    sb = get_supabase()
-    if sb and intentos:
         rows = [
             {"match_key": mk, "intento": info.get("intentos", 1), "ultimo": info.get("ultimo")}
             for mk, info in intentos.items()
+            if info != _intentos_iniciales.get(mk) and mk not in eliminados
         ]
         try:
             for i in range(0, len(rows), 100):
                 sb.table("scraper_retries").upsert(rows[i:i + 100], on_conflict="match_key").execute()
+            keys = sorted(eliminados)
+            for i in range(0, len(keys), 50):
+                sb.table("scraper_retries").delete().in_("match_key", keys[i:i + 50]).execute()
             return
         except Exception as e:
+            if os.environ.get("GITHUB_ACTIONS") == "true":
+                raise RuntimeError("No se pudo persistir el estado de reintentos") from e
             logger.warning(f"  ⚠️ No se pudo guardar scraper_retries en DB: {e}. Usando JSON local.")
-
+    elif os.environ.get("GITHUB_ACTIONS") == "true":
+        raise RuntimeError("Supabase no disponible para persistir reintentos")
     INTENTOS_FILE.write_text(json.dumps(intentos, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
@@ -267,87 +246,32 @@ def nombres_coinciden(nombre_json: str, nombre_web: str) -> bool:
 # ─── Detectar partidos pendientes ────────────────────────────────────────────
 
 def buscar_partidos_pendientes() -> list[dict]:
-    """
-    Consulta Supabase para encontrar partidos del equipo sin resultado
-    cuyo tiempo estimado de finalización ya pasó.
-    """
-    sb = get_supabase()
-    if not sb:
-        logger.error("Supabase no configurado. No se pueden buscar partidos pendientes.")
-        return []
-
-    ahora = datetime.now()
-    intentos = cargar_intentos()
-    pendientes = []
-    descartados = 0
-    team_first = TEAM_NAME.split()[0]  # "ADESA" de "ADESA 80"
-    # Estados terminales — filtrados directamente en la query para reducir filas transferidas
-    excluded_estados = {"cancelado", "aplazado", "esperando_resultado", "finalizado", "sin_resultado"}
-
-    try:
-        query = sb.table("matches").select(
-            "match_key, fecha, hora, local, visitante, estado, group_id, competition_id, "
-            "comp_groups!inner(phase, name, "
-            "comp_categories!inner(slug, "
-            "competitions!inner(slug, url)))"
-        ).eq("es_resultado", False).not_.in_("estado", list(excluded_estados))
-        if not WATCH_ALL_CLUBS:
-            query = query.or_(f"local.ilike.%{team_first}%,visitante.ilike.%{team_first}%")
-        res = query.execute()
-    except Exception as e:
-        logger.error(f"Error consultando Supabase: {e}")
-        return []
-
-    total = len(res.data or [])
-    scope = "todos los clubes" if WATCH_ALL_CLUBS else TEAM_NAME
-    logger.info(f"Supabase: {total} partidos de {scope} sin resultado (estado pendiente)")
-
-    for m in (res.data or []):
-        fecha_str = m.get("fecha", "")
-        hora_str = m.get("hora", "")
-        if not fecha_str:
-            continue
-
-        dt_inicio = parse_fecha(fecha_str, hora_str)
-        dt_fin_estimado = dt_inicio + timedelta(hours=DURACION_PARTIDO_HORAS)
-
-        if dt_fin_estimado >= ahora:
-            continue
-
-        pid = m.get("match_key", "")
-        if not pid:
-            continue
-
-        info = intentos.get(pid, {})
-        n_intentos = info.get("intentos", 0)
-        if n_intentos >= MAX_INTENTOS:
-            descartados += 1
-            continue
-
+    """Use the exact same query, state and policy as the lightweight precheck."""
+    global _intentos_iniciales
+    matches, intentos = load_context(_CFG)
+    if os.environ.get("GITHUB_ACTIONS") != "true" and INTENTOS_FILE.exists():
+        # Local recovery after a failed DB write; DB remains authoritative in CI.
+        local = json.loads(INTENTOS_FILE.read_text(encoding="utf-8"))
+        from scraper_schedule import parse_timestamp
+        for key, info in local.items():
+            local_time = parse_timestamp(info.get("ultimo"))
+            db_time = parse_timestamp(intentos.get(key, {}).get("ultimo"))
+            if local_time and (not db_time or local_time > db_time):
+                intentos[key] = info
+    _intentos_iniciales = {key: dict(info) for key, info in intentos.items()}
+    pendientes = pending_matches(matches, intentos, _CFG)
+    for m in pendientes:
         cg = m.get("comp_groups", {}) or {}
         cc = cg.get("comp_categories", {}) or {}
         comp = cc.get("competitions", {}) or {}
-
-        pendientes.append({
-            "local": m.get("local", ""),
-            "visitante": m.get("visitante", ""),
-            "fecha": fecha_str,
-            "hora": hora_str,
-            "estado": m.get("estado", "proximo"),
+        m.update({
             "comp_url": comp.get("url", ""),
             "comp_slug": comp.get("slug", ""),
             "cat_carpeta": cc.get("slug", ""),
             "fase_carpeta": cg.get("phase", ""),
             "grupo_carpeta": cg.get("name", ""),
-            "group_id": m.get("group_id", ""),
-            "competition_id": m.get("competition_id", ""),
-            "dt_inicio": dt_inicio,
-            "pid": pid,
-            "intento": n_intentos + 1,
         })
-
-    if descartados:
-        logger.info(f"  {descartados} descartado(s) (max {MAX_INTENTOS} intentos)")
+    logger.info(f"Supabase: {len(matches)} candidatos recientes; {len(pendientes)} consultas vencidas")
     return pendientes
 
 
@@ -436,6 +360,8 @@ async def seleccionar_dropdown(page, selector: str, ddl_name: str, value: str, m
             
             # Esperar a que el selector esté disponible
             await page.wait_for_selector(selector, timeout=10000, state="visible")
+            if await page.locator(selector).input_value() == value:
+                return True
             
             # Intentar selección con navegación
             try:
@@ -691,7 +617,7 @@ async def scrape_otros_grupos_en_fase(
     if not comp_id or comp_id not in (page.url or ""):
         await page.goto(comp_url, wait_until="domcontentloaded", timeout=60000)
         if not await esperar_pagina(page, timeout=60000):
-            return []
+            raise RuntimeError("No se pudo leer la fase para buscar grupos alternativos")
         await esperar_dropdown_con_opciones(page, SEL_CAT)
         await pausa(0.5, 1.0)
 
@@ -699,9 +625,9 @@ async def scrape_otros_grupos_en_fase(
     cats = [c for c in cats if c["value"]]
     cat_value = match_opcion_a_carpeta(cats, cat_carpeta)
     if not cat_value:
-        return []
+        raise RuntimeError("No se pudo leer la fase para buscar grupos alternativos")
     if not await seleccionar_dropdown(page, SEL_CAT, DDL_CATEGORIAS, cat_value, max_retries=2):
-        return []
+        raise RuntimeError("No se pudo leer la fase para buscar grupos alternativos")
     await esperar_dropdown_con_opciones(page, SEL_FASE)
 
     fases = await obtener_opciones(page, SEL_FASE)
@@ -710,18 +636,21 @@ async def scrape_otros_grupos_en_fase(
     if not fase_value:
         fase_value = fases[0]["value"] if len(fases) == 1 else None
     if not fase_value:
-        return []
+        raise RuntimeError("No se pudo leer la fase para buscar grupos alternativos")
     if not await seleccionar_dropdown(page, SEL_FASE, DDL_FASES, fase_value, max_retries=2):
-        return []
+        raise RuntimeError("No se pudo leer la fase para buscar grupos alternativos")
     await esperar_dropdown_con_opciones(page, SEL_GRUPO)
 
     grupos = await obtener_opciones(page, SEL_GRUPO)
     grupos = [g for g in grupos if g["value"]]
 
+    if not grupos:
+        raise RuntimeError("La fase no contiene grupos legibles")
+
     for grupo_opt in grupos:
         logger.info(f"  🔍 Grupo de la fase: '{grupo_opt['text']}'")
         if not await seleccionar_dropdown(page, SEL_GRUPO, DDL_GRUPOS, grupo_opt["value"], max_retries=2):
-            continue
+            raise RuntimeError("No se pudo seleccionar un grupo alternativo")
         try:
             cal_tab = page.locator("#calendario-tab")
             if await cal_tab.count() > 0:
@@ -756,7 +685,9 @@ def actualizar_supabase_resultados(partidos_web: list[dict], group_id: str = Non
     """
     sb = get_supabase()
     if not sb:
-        return set()
+        raise RuntimeError("Supabase no disponible para guardar resultados")
+    if not group_id and not competition_id:
+        raise ValueError("Los resultados deben acotarse a un grupo o competición")
 
     con_resultado = [pw for pw in partidos_web if pw.get("es_resultado")]
     if not con_resultado:
@@ -764,15 +695,16 @@ def actualizar_supabase_resultados(partidos_web: list[dict], group_id: str = Non
 
     # 1. Obtener todos los matches del grupo en una sola consulta
     try:
-        query = sb.table("matches").select("id, match_key, fecha, local, visitante, es_resultado")
+        query = sb.table("matches").select(
+            "match_key,fecha,local,visitante,es_resultado,group_id,competition_id,hora,pabellon"
+        ).eq("es_resultado", False)
         if group_id:
             query = query.eq("group_id", group_id)
         elif competition_id:
             query = query.eq("competition_id", competition_id)
         existing = query.execute()
     except Exception as e:
-        logger.error(f"  Supabase select error: {e}")
-        return set()
+        raise RuntimeError("No se pudieron leer los partidos para guardar resultados") from e
 
     db_rows = existing.data or []
     if not db_rows:
@@ -791,7 +723,7 @@ def actualizar_supabase_resultados(partidos_web: list[dict], group_id: str = Non
     # 3. Cruzar resultados web con matches de BD
     updates: list[dict] = []
     actualizados: set[str] = set()
-    ts = datetime.now().isoformat()
+    ts = utc_now().isoformat()
 
     def _buscar_db_match(fecha_web: str, loc_web: str, vis_web: str) -> Optional[dict]:
         """Primero match exacto por clave; si falla, intento fuzzy por nombre de equipo.
@@ -834,6 +766,7 @@ def actualizar_supabase_resultados(partidos_web: list[dict], group_id: str = Non
         return None
 
     sin_match: list[str] = []
+    seen_updates: set[str] = set()
     for pw in con_resultado:
         loc = pw.get("local", "").strip()
         vis = pw.get("visitante", "").strip()
@@ -844,30 +777,46 @@ def actualizar_supabase_resultados(partidos_web: list[dict], group_id: str = Non
             sin_match.append(f"{pw.get('fecha','')} {loc} vs {vis}")
             continue
         if db_match.get("es_resultado"):
-            # Ya tiene resultado — registrar como actualizado sin re-escribir
-            actualizados.add(db_match["match_key"])
+            # No contar resultados históricos como nuevas escrituras.
             continue
+        if db_match["match_key"] in seen_updates:
+            continue
+        seen_updates.add(db_match["match_key"])
+        direct = nombres_coinciden(loc, db_match["local"]) and nombres_coinciden(vis, db_match["visitante"])
+        reverse_exact = slugify(loc) == slugify(db_match["visitante"]) and slugify(vis) == slugify(db_match["local"])
+        reverse = reverse_exact or (not direct and nombres_coinciden(loc, db_match["visitante"])
+                                    and nombres_coinciden(vis, db_match["local"]))
+        ml, mv = pw["marcador_local"], pw["marcador_visitante"]
+        if reverse:
+            ml, mv = mv, ml
         updates.append({
             "match_key": db_match["match_key"],
-            "marcador_local": pw["marcador_local"],
-            "marcador_visitante": pw["marcador_visitante"],
+            # PostgreSQL validates NOT NULL before resolving ON CONFLICT. A
+            # partial upsert with only scores cannot update this schema.
+            "group_id": db_match["group_id"],
+            "competition_id": db_match["competition_id"],
+            "fecha": db_match["fecha"],
+            "local": db_match["local"],
+            "visitante": db_match["visitante"],
+            "marcador_local": ml,
+            "marcador_visitante": mv,
             "es_resultado": True,
             "estado": "finalizado",
-            "hora": pw.get("hora", ""),
-            "pabellon": pw.get("pabellon", ""),
+            "hora": pw.get("hora") or db_match.get("hora", ""),
+            "pabellon": pw.get("pabellon") or db_match.get("pabellon", ""),
             "updated_at": ts,
         })
-        logger.info(f"  RESULTADO: {loc} {pw['marcador_local']}-{pw['marcador_visitante']} {vis}")
-        actualizados.add(db_match["match_key"])
 
     # 4. Upsert en bloque (on_conflict=match_key)
     if updates:
         try:
             for i in range(0, len(updates), 100):
-                sb.table("matches").upsert(updates[i:i + 100], on_conflict="match_key").execute()
+                batch = updates[i:i + 100]
+                sb.table("matches").upsert(batch, on_conflict="match_key").execute()
+                actualizados.update(row["match_key"] for row in batch)
             logger.info(f"  🗄️  Supabase: {len(updates)} resultado(s) actualizados")
         except Exception as e:
-            logger.error(f"  Supabase batch update error: {e}")
+            raise RuntimeError("No se pudieron persistir los resultados") from e
 
     if sin_match:
         logger.warning(f"  ⚠️  {len(sin_match)} resultado(s) web sin match en DB: {sin_match}")
@@ -884,7 +833,7 @@ def marcar_supabase_estado(match_key: str, estado: str):
     try:
         sb.table("matches").update({
             "estado": estado,
-            "updated_at": datetime.now().isoformat(),
+            "updated_at": utc_now().isoformat(),
         }).eq("match_key", match_key).execute()
     except Exception as e:
         logger.error(f"  Supabase marca estado error: {e}")
@@ -923,7 +872,7 @@ def _run_finalizar(run_id: Optional[str], status: str, grupos_scrapeados: int,
             "groups_scraped": grupos_scrapeados,
             "matches_upserted": matches_actualizados,
             "errors": errors,
-            "finished_at": datetime.now().isoformat(),
+            "finished_at": utc_now().isoformat(),
         }).eq("id", run_id).execute()
     except Exception as e:
         logger.warning(f"  ⚠️ No se pudo actualizar scraper_run: {e}")
@@ -932,193 +881,119 @@ def _run_finalizar(run_id: Optional[str], status: str, grupos_scrapeados: int,
 # ─── Pipeline principal ──────────────────────────────────────────────────────
 
 async def actualizar_resultados(headless: bool = False, check_only: bool = False) -> int:
-    logger.info("=" * 60)
-    logger.info(f"SCRAPER RAPIDO DE RESULTADOS -- {TEAM_NAME}")
-    logger.info(f"{datetime.now().strftime('%d/%m/%Y %H:%M')}")
-    logger.info("=" * 60)
-
+    logger.info(f"SCRAPER RESULTADOS -- {TEAM_NAME} -- {utc_now().astimezone(MADRID):%d/%m/%Y %H:%M}")
     pendientes = buscar_partidos_pendientes()
-
     if not pendientes:
-        logger.info("No hay partidos pendientes de resultado.")
+        logger.info("No hay consultas de resultados vencidas.")
+        return 0
+    if check_only:
+        for match in pendientes:
+            logger.info(f"  [{match['intento']}/{MAX_INTENTOS}] {match['local']} - {match['visitante']}")
         return 0
 
-    logger.info(f"\n{len(pendientes)} partido(s) pendiente(s):")
-    for p in pendientes:
-        logger.info(f"  [{p['intento']}/{MAX_INTENTOS}] {p.get('local','?')} vs {p.get('visitante','?')} "
-                     f"({p.get('fecha','?')} {p.get('hora','?')}) -- {p['cat_carpeta']}")
-
-    if check_only:
-        logger.info("\n(modo --check: no se realiza scraping)")
-        return len(pendientes)
-
+    # Each group is fetched once, ordered to reuse the current competition/category.
     grupos = agrupar_por_grupo(pendientes)
-    logger.info(f"\n{len(grupos)} grupo(s) a scrapear")
-
-    run_id = _run_comenzar()
-    pw_inst, browser, context, page = await crear_browser(headless=headless)
-    total_actualizados = 0
+    intentos = {key: dict(info) for key, info in _intentos_iniciales.items()}
+    resueltos: set[str] = set()
+    run_errors: list[dict] = []
     grupos_scrapeados = 0
-    run_errors: list = []
-    intentos = cargar_intentos()
-    run_status = "completed"
-    # Caché por ejecución: escanea cada fase (comp_url,cat,fase) una sola vez al buscar
-    # partidos en grupos alternativos (evita N×G postbacks).
     otros_grupos_cache: dict = {}
+    run_id = _run_comenzar()
+    pw_inst = browser = None
+
+    def registrar_consulta(match: dict, *, comprobado: bool):
+        # Only a successful source read consumes the result-attempt budget.
+        # Technical failures still persist a cooldown so the next run cannot spin.
+        intentos[match['pid']] = {
+            "intentos": match['intento'] if comprobado else match['intento'] - 1,
+            "ultimo": utc_now().isoformat(),
+        }
 
     try:
-        for key, partidos_grupo in grupos.items():
-            comp_slug, cat_carpeta, grupo_carpeta, fase_carpeta = key.split("|")
-
-            comp_url = partidos_grupo[0]["comp_url"]
-            if not comp_url:
-                logger.warning(f"  Competicion '{comp_slug}' sin URL en Supabase. Saltando.")
-                continue
-
-            logger.info(f"\n{'─' * 50}")
-            logger.info(f"  {comp_slug} / {cat_carpeta} / {grupo_carpeta}")
-
+        pw_inst, browser, context, page = await crear_browser(headless=headless)
+        for key, partidos_grupo in sorted(grupos.items()):
+            first = partidos_grupo[0]
+            comp_url = first['comp_url']
+            logger.info(f"Grupo: {key}; {len(partidos_grupo)} consulta(s)")
             try:
+                if not comp_url:
+                    raise RuntimeError("Competición sin URL en Supabase")
                 partidos_web = await scrape_grupo(
-                    page, comp_url, cat_carpeta, fase_carpeta, grupo_carpeta
+                    page, comp_url, first['cat_carpeta'], first['fase_carpeta'], first['grupo_carpeta']
                 )
+                if not partidos_web:
+                    raise RuntimeError("El grupo no se pudo leer o no contiene partidos")
                 grupos_scrapeados += 1
-            except Exception as e:
-                logger.error(f"  Error scraping: {e}")
-                run_errors.append({"grupo": key, "error": str(e)})
+                confirmed = actualizar_supabase_resultados(partidos_web, group_id=first.get('group_id'),
+                                                          competition_id=first.get('competition_id'))
+                resueltos.update(confirmed)
+                for match in partidos_grupo:
+                    pid = match['pid']
+                    if pid in resueltos:
+                        intentos.pop(pid, None)
+                        continue
+                    # Search alternate groups only at the beginning and end of the
+                    # budget, reusing a phase cache rather than scanning each retry.
+                    web_match = [row for row in partidos_web
+                                 if build_lookup_key(row.get('fecha', ''), row.get('local', ''), row.get('visitante', ''))
+                                 == build_lookup_key(match['fecha'], match['local'], match['visitante'])]
+                    if not web_match and match['intento'] in (1, MAX_INTENTOS):
+                        alternatives = await scrape_otros_grupos_en_fase(
+                            page, comp_url, match['cat_carpeta'], match['fase_carpeta'],
+                            match['grupo_carpeta'], cache=otros_grupos_cache,
+                        )
+                        # Keep the date, not just team names: the same teams may
+                        # meet repeatedly in one season.
+                        candidates = [row for row in alternatives
+                                      if fecha_key(row.get('fecha', '')) == fecha_key(match['fecha'])
+                                      and nombres_coinciden(row.get('local', ''), match['local'])
+                                      and nombres_coinciden(row.get('visitante', ''), match['visitante'])]
+                        confirmed = actualizar_supabase_resultados(
+                            candidates, competition_id=match.get('competition_id')
+                        )
+                        resueltos.update(confirmed)
+                        if pid in confirmed:
+                            intentos.pop(pid, None)
+                            continue
+                    registrar_consulta(match, comprobado=True)
+                    if match['intento'] >= MAX_INTENTOS:
+                        # A missing score says nothing about cancellation or postponement.
+                        marcar_supabase_estado(pid, 'esperando_resultado')
+                        logger.info(f"  Presupuesto agotado: {pid}; continúa en los dos scrapeos generales diarios")
+                    else:
+                        logger.info(f"  Sin resultado: {pid}; intento {match['intento']}/{MAX_INTENTOS}")
+            except Exception as exc:
+                logger.error(f"Error al consultar {key}: {exc}")
+                run_errors.append({"grupo": key, "error": str(exc)})
+                for match in partidos_grupo:
+                    if match['pid'] not in resueltos:
+                        registrar_consulta(match, comprobado=False)
                 try:
-                    await page.goto("about:blank")
-                    await pausa(0.5, 1.0)
+                    await page.goto('about:blank')
                 except Exception:
                     pass
-                for p in partidos_grupo:
-                    info = intentos.get(p["pid"], {"intentos": 0})
-                    info["intentos"] = info.get("intentos", 0) + 1
-                    info["ultimo"] = datetime.now().isoformat()
-                    intentos[p["pid"]] = info
-                continue
-
-            if not partidos_web:
-                for p in partidos_grupo:
-                    info = intentos.get(p["pid"], {"intentos": 0})
-                    info["intentos"] = info.get("intentos", 0) + 1
-                    info["ultimo"] = datetime.now().isoformat()
-                    intentos[p["pid"]] = info
-                continue
-
-            con_resultado = [pw for pw in partidos_web if pw["es_resultado"]]
-            logger.info(f"  Web: {len(partidos_web)} partidos ({len(con_resultado)} con resultado)")
-
-            # Actualizar resultados en Supabase y obtener qué match_keys se actualizaron
-            # Pasar group_id para evitar contaminar partidos de otras categorías
-            group_id = partidos_grupo[0].get("group_id") if partidos_grupo else None
-            pids_actualizados = actualizar_supabase_resultados(partidos_web, group_id=group_id)
-            total_actualizados += len(pids_actualizados)
-
-            for p in partidos_grupo:
-                pid = p["pid"]
-                if pid in pids_actualizados:
-                    intentos.pop(pid, None)
-                else:
-                    info = intentos.get(pid, {"intentos": 0})
-                    info["intentos"] = info.get("intentos", 0) + 1
-                    info["ultimo"] = datetime.now().isoformat()
-                    intentos[pid] = info
-                    n = info["intentos"]
-                    if n >= MAX_INTENTOS:
-                        logger.info(f"  RENDIDO ({n}/{MAX_INTENTOS}): {p['local']} vs {p['visitante']}")
-                        misma_fecha = [pw for pw in partidos_web if pw.get("fecha") == p["fecha"]]
-                        con_res = [pw for pw in misma_fecha if pw.get("es_resultado")]
-                        if len(misma_fecha) > 0 and len(con_res) >= len(misma_fecha) * 0.5:
-                            estado_new = "aplazado"
-                            logger.info(f"  APLAZADO ({len(con_res)}/{len(misma_fecha)} partidos con resultado)")
-                        else:
-                            estado_new = "esperando_resultado"
-                            logger.info(f"  ESPERANDO RESULTADO ({len(con_res)}/{len(misma_fecha)} partidos)")
-                        marcar_supabase_estado(pid, estado_new)
-                    else:
-                        logger.info(f"  Sin resultado ({n}/{MAX_INTENTOS}). Se reintentara en ~{RETRY_INTERVAL_MIN}min.")
-                        # Diagnóstico: ¿está el partido en la web (con o sin marcador)?
-                        pw_en_web = [
-                            pw for pw in partidos_web
-                            if pw.get("fecha", "") == p.get("fecha", "")
-                            and nombres_coinciden(pw.get("local", ""), p["local"])
-                            and nombres_coinciden(pw.get("visitante", ""), p["visitante"])
-                        ]
-                        if pw_en_web:
-                            pw0 = pw_en_web[0]
-                            if pw0.get("es_resultado"):
-                                logger.warning(
-                                    f"  ⚠️  La web SÍ tiene resultado "
-                                    f"({pw0['marcador_local']}-{pw0['marcador_visitante']}) "
-                                    f"pero falló el cruce con DB. "
-                                    f"Web: '{pw0['local']}' vs '{pw0['visitante']}' | "
-                                    f"DB: '{p['local']}' vs '{p['visitante']}'"
-                                )
-                            else:
-                                logger.info(f"  La web aún no tiene marcador para este partido.")
-                        else:
-                            logger.warning(
-                                f"  ⚠️  Partido NO encontrado en grupo '{grupo_carpeta}'. "
-                                f"Probando otros grupos de la fase '{fase_carpeta}'..."
-                            )
-                            # Buscar en otros grupos de la misma fase/categoría
-                            try:
-                                partidos_alt = await scrape_otros_grupos_en_fase(
-                                    page, comp_url, cat_carpeta, fase_carpeta, grupo_carpeta,
-                                    cache=otros_grupos_cache,
-                                )
-                                pw_alt = [
-                                    pw for pw in partidos_alt
-                                    if nombres_coinciden(pw.get("local", ""), p["local"])
-                                    and nombres_coinciden(pw.get("visitante", ""), p["visitante"])
-                                ]
-                                if pw_alt:
-                                    pw0 = pw_alt[0]
-                                    logger.info(
-                                        f"  Partido encontrado en otro grupo: "
-                                        f"fecha={pw0.get('fecha','')} resultado={pw0.get('es_resultado')}"
-                                    )
-                                    if pw0.get("es_resultado"):
-                                        # Actualizar sin filtro de group_id (el partido está mal asignado en DB)
-                                        pids_extra = actualizar_supabase_resultados(
-                                            [pw0], group_id=None,
-                                            competition_id=p.get("competition_id") or None,
-                                        )
-                                        if pid in pids_extra:
-                                            intentos.pop(pid, None)
-                                            total_actualizados += 1
-                                            logger.info(
-                                                f"  ✅ RESULTADO actualizado desde grupo alternativo: "
-                                                f"{pw0['local']} {pw0['marcador_local']}-"
-                                                f"{pw0['marcador_visitante']} {pw0['visitante']}"
-                                            )
-                                    else:
-                                        logger.info(f"  Partido en otro grupo pero aún sin marcador.")
-                                else:
-                                    logger.warning(
-                                        f"  ⚠️  Partido '{p['local']}' vs '{p['visitante']}' "
-                                        f"({p.get('fecha','')}) no encontrado en ningún grupo."
-                                    )
-                            except Exception as e_alt:
-                                logger.warning(f"  ⚠️  Error en búsqueda alternativa: {e_alt}")
-
-            await pausa(0.5, 1.0)
-
-    except Exception as e:
-        logger.error(f"Error: {e}", exc_info=True)
-        run_errors.append({"error": str(e)})
-        run_status = "failed"
+    except Exception as exc:
+        run_errors.append({"error": str(exc)})
+        for match in pendientes:
+            if match['pid'] not in resueltos:
+                registrar_consulta(match, comprobado=False)
     finally:
-        await browser.close()
-        await pw_inst.stop()
-        guardar_intentos(intentos)
-        _run_finalizar(run_id, run_status, grupos_scrapeados, total_actualizados, run_errors)
-
-    logger.info(f"\n{'=' * 60}")
-    logger.info(f"RESUMEN: {total_actualizados} resultado(s) de {len(pendientes)} pendiente(s)")
-    logger.info(f"{'=' * 60}")
-    return total_actualizados
+        try:
+            guardar_intentos(intentos, resueltos)
+        except Exception as exc:
+            run_errors.append({"error": str(exc)})
+        try:
+            if browser:
+                await browser.close()
+            if pw_inst:
+                await pw_inst.stop()
+        finally:
+            _run_finalizar(run_id, 'failed' if run_errors else 'completed',
+                           grupos_scrapeados, len(resueltos), run_errors)
+    if run_errors:
+        raise RuntimeError(f"Fallaron {len(run_errors)} operaciones; consulta los logs de la ejecución")
+    logger.info(f"RESUMEN: {len(resueltos)} resultado(s) guardados; {len(grupos)} grupo(s)")
+    return len(resueltos)
 
 # ─── CLI ─────────────────────────────────────────────────────────────────────
 

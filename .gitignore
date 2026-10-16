@@ -15,9 +15,9 @@ scraper_log.txt
 
 # Entorno local
 .env
+.scraper-pending.json
 
-# Estado de reintentos (se gestiona en el repo, pero ignorar localmente si no quieres subir cambios manuales)
-# intentos_resultados.json  ← NO ignorar, el workflow lo necesita
+# intentos_resultados.json es un respaldo local; CI persiste solo en Supabase.
 
 # macOS
 .DS_Store
