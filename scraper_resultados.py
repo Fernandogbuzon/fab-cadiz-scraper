@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
-from scraper_common import build_lookup_key, fecha_key, parse_fecha_hora, slugify as _shared_slugify
+from scraper_common import build_lookup_key, es_equipo_del_club, fecha_iso, fecha_key, parse_fecha_hora, slugify as _shared_slugify
 from scraper_schedule import MADRID, pending_matches, utc_now
 from scraper_precheck import load_context
 
@@ -209,9 +209,15 @@ def nombres_coinciden(nombre_json: str, nombre_web: str) -> bool:
     a = normalizar_nombre(nombre_json)
     b = normalizar_nombre(nombre_web)
 
+    if not a or not b:
+        return False
     # Exacto
     if a == b:
         return True
+
+    # Las variantes del club son inscripciones distintas (color, letra, año).
+    if es_equipo_del_club(a, TEAM_NAME) or es_equipo_del_club(b, TEAM_NAME):
+        return slugify(a) == slugify(b)
 
     # Uno contenido en el otro (ej: 'CBA' en 'ISAVAL CBA')
     if a in b or b in a:
@@ -375,7 +381,7 @@ async def seleccionar_dropdown(page, selector: str, ddl_name: str, value: str, m
 
             # Verificar que la página esté lista
             ok = await esperar_pagina(page, timeout=90000)
-            if ok:
+            if ok and await page.locator(selector).input_value() == value:
                 await pausa(0.5, 1.2)
                 return True
 
@@ -402,7 +408,8 @@ async def extraer_partidos_pagina(page) -> list[dict]:
 
             cal.querySelectorAll('header.nombre_tabla').forEach(header => {
                 const h5 = header.querySelector('h5');
-                const jornada = h5 ? h5.textContent.trim().replace(/\\s+/g, ' ') : '';
+                if (!h5) return;
+                const jornada = h5.textContent.trim().replace(/\\s+/g, ' ');
 
                 let tc = header.nextElementSibling;
                 while (tc && !tc.classList.contains('table-responsive')) tc = tc.nextElementSibling;
@@ -671,7 +678,7 @@ async def scrape_otros_grupos_en_fase(
 
 
 def actualizar_supabase_resultados(partidos_web: list[dict], group_id: str = None,
-                                   competition_id: str = None) -> set[str]:
+                                   competition_id: str = None, esperado: dict | None = None) -> set[str]:
     """
     Actualiza resultados de partidos en Supabase a partir de los datos web.
     Devuelve el set de match_keys actualizados.
@@ -697,11 +704,13 @@ def actualizar_supabase_resultados(partidos_web: list[dict], group_id: str = Non
     try:
         query = sb.table("matches").select(
             "match_key,fecha,local,visitante,es_resultado,group_id,competition_id,hora,pabellon"
-        ).eq("es_resultado", False)
+        )
         if group_id:
             query = query.eq("group_id", group_id)
         elif competition_id:
             query = query.eq("competition_id", competition_id)
+            if esperado:
+                query = query.eq("fecha_iso", fecha_iso(esperado["fecha"]))
         existing = query.execute()
     except Exception as e:
         raise RuntimeError("No se pudieron leer los partidos para guardar resultados") from e
@@ -714,9 +723,10 @@ def actualizar_supabase_resultados(partidos_web: list[dict], group_id: str = Non
 
     # 2. Construir lookup: fecha_sin_barras + equipos_ordenados → match de BD
     #    Normalizamos las fechas a DDMMYYYY con ceros (ej: "25/4/2026" → "25042026")
-    db_lookup: dict[str, dict] = {}
+    db_lookup: dict[str, list[dict]] = {}
     for m in db_rows:
-        db_lookup[build_lookup_key(m.get("fecha", ""), m.get("local", ""), m.get("visitante", ""))] = m
+        key = build_lookup_key(m["fecha"], m["local"], m["visitante"])
+        db_lookup.setdefault(key, []).append(m)
 
     logger.info(f"  🗄️  Supabase: {len(db_rows)} matches en el grupo para cruzar")
 
@@ -728,42 +738,30 @@ def actualizar_supabase_resultados(partidos_web: list[dict], group_id: str = Non
     def _buscar_db_match(fecha_web: str, loc_web: str, vis_web: str) -> Optional[dict]:
         """Primero match exacto por clave; si falla, intento fuzzy por nombre de equipo.
         Si sigue fallando, prueba ±1 día (la web y la BD a veces difieren en 1 día)."""
-        fc = fecha_key(fecha_web)
         key = build_lookup_key(fecha_web, loc_web, vis_web)
-        m = db_lookup.get(key)
-        if m:
-            return m
-        # Fallback fuzzy: misma fecha normalizada, nombres similares
-        for db_key, db_m in db_lookup.items():
-            if not db_key.startswith(fc + "_"):
-                continue
-            db_loc = db_m.get("local", "")
-            db_vis = db_m.get("visitante", "")
-            if (nombres_coinciden(loc_web, db_loc) and nombres_coinciden(vis_web, db_vis)) or \
-               (nombres_coinciden(loc_web, db_vis) and nombres_coinciden(vis_web, db_loc)):
-                logger.info(f"  Fuzzy match: '{loc_web}' → '{db_loc}' / '{vis_web}' → '{db_vis}'")
-                return db_m
-        # Fallback ±1 día: a veces la federación registra el partido con 1 día de diferencia
+        exactos = db_lookup.get(key, [])
+        if exactos:
+            return exactos[0] if len(exactos) == 1 else None
+        if not group_id:
+            return None
+        candidatos = [
+            m for m in db_rows if fecha_key(m["fecha"]) == fecha_key(fecha_web)
+            and ((nombres_coinciden(loc_web, m["local"]) and nombres_coinciden(vis_web, m["visitante"]))
+                 or (nombres_coinciden(loc_web, m["visitante"]) and nombres_coinciden(vis_web, m["local"])))
+        ]
+        if candidatos:
+            return candidatos[0] if len(candidatos) == 1 else None
+
+        # Para una fecha desplazada exigimos los dos equipos exactos y un único partido.
         try:
-            d, mo, y = fecha_web.split("/")
-            dt_base = datetime(int(y), int(mo), int(d))
-            for delta in (-1, 1):
-                fc_adj = fecha_key((dt_base + timedelta(days=delta)).strftime("%d/%m/%Y"))
-                for db_key, db_m in db_lookup.items():
-                    if not db_key.startswith(fc_adj + "_"):
-                        continue
-                    db_loc = db_m.get("local", "")
-                    db_vis = db_m.get("visitante", "")
-                    if (nombres_coinciden(loc_web, db_loc) and nombres_coinciden(vis_web, db_vis)) or \
-                       (nombres_coinciden(loc_web, db_vis) and nombres_coinciden(vis_web, db_loc)):
-                        logger.info(
-                            f"  Match ±1 día: web={fecha_web} → DB={db_m.get('fecha','')} "
-                            f"'{db_loc}' vs '{db_vis}'"
-                        )
-                        return db_m
-        except Exception:
-            pass
-        return None
+            dia = datetime.strptime(fecha_web, "%d/%m/%Y")
+        except ValueError:
+            return None
+        cercanos = []
+        for delta in (-1, 1):
+            fecha = (dia + timedelta(days=delta)).strftime("%d/%m/%Y")
+            cercanos.extend(db_lookup.get(build_lookup_key(fecha, loc_web, vis_web), []))
+        return cercanos[0] if len(cercanos) == 1 else None
 
     sin_match: list[str] = []
     seen_updates: set[str] = set()
@@ -773,7 +771,7 @@ def actualizar_supabase_resultados(partidos_web: list[dict], group_id: str = Non
         if not loc or not vis:
             continue
         db_match = _buscar_db_match(pw.get("fecha", ""), loc, vis)
-        if not db_match:
+        if not db_match or (esperado and db_match["match_key"] != esperado["pid"]):
             sin_match.append(f"{pw.get('fecha','')} {loc} vs {vis}")
             continue
         if db_match.get("es_resultado"):
@@ -944,13 +942,14 @@ async def actualizar_resultados(headless: bool = False, check_only: bool = False
                         )
                         # Keep the date, not just team names: the same teams may
                         # meet repeatedly in one season.
-                        candidates = [row for row in alternatives
-                                      if fecha_key(row.get('fecha', '')) == fecha_key(match['fecha'])
-                                      and nombres_coinciden(row.get('local', ''), match['local'])
-                                      and nombres_coinciden(row.get('visitante', ''), match['visitante'])]
+                        clave = build_lookup_key(match["fecha"], match["local"], match["visitante"])
+                        candidates = [
+                            row for row in alternatives
+                            if build_lookup_key(row["fecha"], row["local"], row["visitante"]) == clave
+                        ]
                         confirmed = actualizar_supabase_resultados(
-                            candidates, competition_id=match.get('competition_id')
-                        )
+                            candidates, competition_id=match.get("competition_id"), esperado=match
+                        ) if len(candidates) == 1 else set()
                         resueltos.update(confirmed)
                         if pid in confirmed:
                             intentos.pop(pid, None)

@@ -39,12 +39,13 @@ import hashlib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
-from urllib.parse import unquote, urljoin
+from urllib.parse import unquote, urljoin, urlsplit
 
 from dotenv import load_dotenv
 from scraper_common import (
     build_stable_match_key,
     competition_storage_slug,
+    es_equipo_del_club,
     seasonal_match_key,
     fecha_iso,
     slugify as _shared_slugify,
@@ -72,7 +73,7 @@ def get_supabase():
     url = url.strip()
     key = key.strip()
     if not url or not key:
-        logger.warning("⚠️ CENTRAL_SUPABASE_URL/CENTRAL_SUPABASE_SERVICE_KEY no configuradas. Solo se guardarán JSON locales.")
+        logger.warning("⚠️ Faltan las credenciales de Supabase Central.")
         return None
     try:
         from supabase import create_client
@@ -306,7 +307,7 @@ async def seleccionar_dropdown(page, selector: str, ddl_name: str, value: str, m
 
             # Verificar que la página esté lista
             ok = await esperar_pagina(page, timeout=90000)
-            if ok:
+            if ok and await page.locator(selector).input_value() == value:
                 await pausa(0.5, 1.2)  # Reducido: esperar_pagina ya garantiza DOM listo
                 return True
 
@@ -344,7 +345,8 @@ async def extraer_partidos(page, categoria: str, fase: str, grupo: str, competic
 
             headers.forEach(header => {
                 const h5 = header.querySelector('h5');
-                const jornadaText = h5 ? h5.textContent.trim().replace(/\\s+/g, ' ') : '';
+                if (!h5) return;
+                const jornadaText = h5.textContent.trim().replace(/\\s+/g, ' ');
 
                 let tc = header.nextElementSibling;
                 while (tc && !tc.classList.contains('table-responsive')) tc = tc.nextElementSibling;
@@ -572,6 +574,7 @@ async def resolver_urls_actuales(page, urls: list[str]) -> list[str]:
         return urls
     try:
         await page.goto(PROVINCE_BASE_URL + "/", wait_until="domcontentloaded", timeout=60000)
+        await page.wait_for_selector("a[href*='delegacion-competicion-']", state="attached", timeout=15000)
         hrefs = await page.eval_on_selector_all(
             "a[href*='delegacion-competicion-']",
             "els => els.map(e => e.getAttribute('href'))",
@@ -581,10 +584,16 @@ async def resolver_urls_actuales(page, urls: list[str]) -> list[str]:
         return urls
 
     vigentes: dict[str, str] = {}
+    base = urlsplit(PROVINCE_BASE_URL)
     for href in hrefs or []:
-        _, slug = _comp_id_y_slug(href or "")
-        if slug:
-            vigentes[slug] = urljoin(PROVINCE_BASE_URL + "/", href)
+        parsed = urlsplit(urljoin(PROVINCE_BASE_URL + "/", href or ""))
+        if (parsed.scheme, parsed.netloc) != (base.scheme, base.netloc):
+            continue
+        if not re.fullmatch(re.escape(base.path) + r"/delegacion-competicion-\d+/[^/]+/?", parsed.path):
+            continue
+        actual = parsed._replace(query="", fragment="").geturl().rstrip("/")
+        _, slug = _comp_id_y_slug(actual)
+        vigentes[slug] = actual
 
     if not vigentes:
         logger.warning("⚠️ Índice sin enlaces de competición. Uso URLs del config.")
@@ -602,14 +611,17 @@ async def resolver_urls_actuales(page, urls: list[str]) -> list[str]:
             resueltas.append(actual)
         else:
             resueltas.append(url)
-    return resueltas
+    if _CFG.get("discover_club_competitions") and not COMPETITIONS_FROM_DB:
+        conocidas = {_comp_id_y_slug(url)[1] for url in urls}
+        resueltas.extend(url for slug, url in vigentes.items() if slug not in conocidas)
+    return list(dict.fromkeys(resueltas))
 
 
 # ─── Content hashing (detección de cambios) ──────────────────────────────────
 
 def _hash_partidos(partidos: list[dict]) -> str:
     """Hash SHA-256 reproducible de los partidos de un grupo para detectar cambios."""
-    key_fields = ["fecha", "local", "visitante", "marcador_local", "marcador_visitante", "hora", "pabellon"]
+    key_fields = ["jornada", "fecha", "local", "visitante", "marcador_local", "marcador_visitante", "hora", "pabellon"]
     normalized = sorted(
         [{k: p.get(k) for k in key_fields} for p in partidos],
         key=lambda p: (p.get("fecha", ""), p.get("local", ""), p.get("visitante", ""))
@@ -802,28 +814,41 @@ def guardar_supabase(
     """
     sb = get_supabase()
     if not sb:
-        return True  # Sin Supabase, asumir que hay que procesar
+        raise RuntimeError("Supabase no disponible para guardar el calendario")
 
     # 1. Competición
     comp_id = _upsert_competition(sb, comp_nombre, comp_carpeta, comp_url)
     if not comp_id:
-        return True
+        raise RuntimeError(f"No se pudo guardar la competición {comp_nombre}")
 
     # 2. Categoría
     cat_id = _upsert_category(sb, comp_id, cat)
     if not cat_id:
-        return True
+        raise RuntimeError(f"No se pudo guardar la categoría {cat}")
 
     # 3. Grupo
     group_id = _upsert_group(sb, cat_id, fase, grupo)
     if not group_id:
-        return True
+        raise RuntimeError(f"No se pudo guardar el grupo {grupo}")
 
     # ── Verificar content hash (delta): si los datos no cambiaron, saltar escrituras ──
     nuevo_hash = _hash_partidos(partidos)
     if _grupo_sin_cambios(sb, group_id, nuevo_hash):
         logger.info(f"      ⏭️  Sin cambios (hash idéntico), saltando escrituras Supabase")
         return False
+
+    # Las filas publicadas conservan su UUID, enlaces y reintentos. Una alta nueva
+    # incluye el grupo incluso si coinciden fecha y nombres con otro grupo.
+    previous = {}
+    offset = 0
+    while True:
+        pagina = (sb.table("matches").select("match_key, estado, hora", count="exact")
+                  .eq("group_id", group_id).order("match_key").range(offset, offset + 499).execute())
+        filas = pagina.data or []
+        previous.update({fila["match_key"]: fila for fila in filas})
+        offset += len(filas)
+        if not filas or (pagina.count is not None and offset >= pagina.count):
+            break
 
     # 4. Partidos – upsert por match_key (dedup por match_key para evitar error 21000)
     matches_dict = {}
@@ -835,6 +860,9 @@ def guardar_supabase(
 
         # match_key: fecha + equipos ordenados + categoría (dedup)
         match_key = seasonal_match_key(SEASON, comp_carpeta, p.get("fecha", ""), loc, vis, cat)
+
+        if match_key not in previous:
+            match_key = f"{match_key}_{group_id}"
 
         estado = "finalizado" if p.get("es_resultado") else "proximo"
         # Si ya existe, preferir la versión con resultado
@@ -929,26 +957,15 @@ def guardar_supabase(
         # si se ha adelantado. La cancelación explícita siempre se conserva.
         TERMINAL_ESTADOS = {"esperando_resultado", "aplazado", "cancelado"}
         horarios_cambiados = set()
-        keys_sin_resultado = [m["match_key"] for m in matches_to_upsert if not m.get("es_resultado")]
-        if keys_sin_resultado:
-            try:
-                previous = {}
-                for i in range(0, len(keys_sin_resultado), 50):
-                    ex_res = sb.table("matches").select("match_key, estado, hora").in_(
-                        "match_key", keys_sin_resultado[i:i + 50]
-                    ).execute()
-                    previous.update({r["match_key"]: r for r in (ex_res.data or [])})
-                for match in matches_to_upsert:
-                    old = previous.get(match["match_key"])
-                    if not old:
-                        continue
-                    changed = (old.get("hora") or "").strip() != (match.get("hora") or "").strip()
-                    if changed:
-                        horarios_cambiados.add(match["match_key"])
-                    if old.get("estado") in TERMINAL_ESTADOS and (not changed or old["estado"] == "cancelado"):
-                        match["estado"] = old["estado"]
-            except Exception as e:
-                raise RuntimeError("No se pudieron comprobar los horarios anteriores") from e
+        for match in matches_to_upsert:
+            old = previous.get(match["match_key"])
+            if not old or match["es_resultado"]:
+                continue
+            changed = (old.get("hora") or "").strip() != (match.get("hora") or "").strip()
+            if changed:
+                horarios_cambiados.add(match["match_key"])
+            if old.get("estado") in TERMINAL_ESTADOS and (not changed or old["estado"] == "cancelado"):
+                match["estado"] = old["estado"]
 
         # Limpiar antes del upsert: si este falla, repetirlo sigue siendo seguro
         # y no perdemos la evidencia del horario anterior para reiniciar consultas.
@@ -967,14 +984,12 @@ def guardar_supabase(
     # ghost games ya conocidos (Issue 4), y matches con group_id incorrecto (Issue 1).
     # Solo actúa sobre partidos de ESTE group_id — no toca otros grupos.
     try:
-        existing_res = sb.table("matches").select("match_key").eq("group_id", group_id).execute()
-        existing_keys = {r["match_key"] for r in (existing_res.data or [])}
-        stale_keys = existing_keys - current_keys
+        stale_keys = previous.keys() - current_keys
         if stale_keys:
             stale_list = list(stale_keys)
             for i in range(0, len(stale_list), 50):
                 batch = stale_list[i:i+50]
-                sb.table("matches").delete().in_("match_key", batch).execute()
+                sb.table("matches").delete().eq("group_id", group_id).in_("match_key", batch).execute()
             logger.info(f"      🗄️  Supabase: eliminados {len(stale_keys)} partidos obsoletos {list(stale_keys)[:3]}")
     except Exception as e:
         logger.error(f"      ❌ Supabase cleanup matches: {e}")
@@ -1052,8 +1067,38 @@ def carpeta_competicion(nombre: str) -> str:
 
 # ─── Scraper de una competición ──────────────────────────────────────────────
 
+def nombres_club_del_grupo(partidos: list[dict], solo_temporada: bool) -> set[str]:
+    inicio, fin = SEASON.split("-")
+    nombres = set()
+    for partido in partidos:
+        if solo_temporada:
+            fecha = fecha_iso(partido.get("fecha", ""))
+            if not f"{inicio}-07-01" <= fecha < f"{fin}-07-01":
+                continue
+        for lado in ("local", "visitante"):
+            nombre = partido[lado].strip()
+            if es_equipo_del_club(nombre, TEAM_NAME):
+                nombres.add(nombre)
+    return nombres
+
+
+def registrar_aliases_club(nombres: set[str], registrados: set[str]):
+    nuevos = sorted(nombres - registrados)
+    if not nuevos:
+        return
+    sb = get_supabase()
+    if not sb:
+        raise RuntimeError("Supabase no disponible para registrar los equipos del club")
+    club = sb.table("clubs").select("id").eq("slug", TEAM_SLUG).eq("active", True).single().execute()
+    filas = [{"club_id": club.data["id"], "team_name": nombre} for nombre in nuevos]
+    sb.table("club_team_aliases").upsert(
+        filas, on_conflict="club_id,team_name", ignore_duplicates=True, default_to_null=False
+    ).execute()
+    registrados.update(nuevos)
+
+
 async def scrape_una_competicion(
-    page, url: str, filtro_cat: Optional[str] = None
+    page, url: str, filtro_cat: Optional[str] = None, solo_grupos_club: bool = False
 ) -> tuple[int, str, int, int]:
     """Scrapea una competición completa.
     Devuelve (total_partidos, comp_carpeta, grupos_escritos, grupos_saltados)."""
@@ -1096,6 +1141,7 @@ async def scrape_una_competicion(
     total_partidos = 0
     grupos_scrapeados = 0
     grupos_saltados = 0
+    aliases_registrados: set[str] = set()
 
     for cat_idx, cat in enumerate(categorias):
         cat_nombre = cat["text"]
@@ -1109,9 +1155,7 @@ async def scrape_una_competicion(
 
         ok = await seleccionar_dropdown(page, SEL_CAT, DDL_CATEGORIAS, cat_value, max_retries=3)
         if not ok:
-            logger.error(f"  ❌ No se pudo cambiar a {cat_nombre} tras múltiples intentos")
-            await asyncio.sleep(3.0)
-            continue
+            raise RuntimeError(f"No se pudo seleccionar la categoría {cat_nombre}")
         # Esperar a que las fases se carguen antes de leerlas
         await esperar_dropdown_con_opciones(page, SEL_FASE)
 
@@ -1131,9 +1175,7 @@ async def scrape_una_competicion(
 
             ok = await seleccionar_dropdown(page, SEL_FASE, DDL_FASES, fase_value, max_retries=2)
             if not ok:
-                logger.warning(f"    ⚠️ No se pudo cambiar a fase {fase_nombre}")
-                await asyncio.sleep(2.0)
-                continue
+                raise RuntimeError(f"No se pudo seleccionar la fase {fase_nombre}")
             # Esperar a que los grupos se carguen antes de leerlos
             await esperar_dropdown_con_opciones(page, SEL_GRUPO)
 
@@ -1153,9 +1195,7 @@ async def scrape_una_competicion(
 
                 ok = await seleccionar_dropdown(page, SEL_GRUPO, DDL_GRUPOS, grupo_value, max_retries=2)
                 if not ok:
-                    logger.warning(f"      ⚠️ No se pudo cambiar a grupo {grupo_nombre}")
-                    await asyncio.sleep(2.0)
-                    continue
+                    raise RuntimeError(f"No se pudo seleccionar el grupo {grupo_nombre}")
 
                 # Asegurar tab CALENDARIO activo
                 try:
@@ -1175,6 +1215,11 @@ async def scrape_una_competicion(
                 if not partidos:
                     logger.warning(f"      ⚠️ Sin partidos")
                     continue
+
+                nombres_club = nombres_club_del_grupo(partidos, solo_temporada=solo_grupos_club)
+                if solo_grupos_club and not nombres_club:
+                    continue
+                registrar_aliases_club(nombres_club, aliases_registrados)
 
                 logger.info(f"      📊 {len(partidos)} partidos")
                 total_partidos += len(partidos)
@@ -1232,6 +1277,7 @@ async def scrape_todas(
     run_status = "completed"
 
     # Reconciliar IDs con los vigentes antes de gastar 60 s por URL muerta.
+    slugs_configurados = {_comp_id_y_slug(url)[1] for url in urls_base}
     urls_base = await resolver_urls_actuales(page, urls_base)
 
     urls_filtradas = []
@@ -1254,7 +1300,9 @@ async def scrape_todas(
                 if delay > 0:
                     await asyncio.sleep(delay)
                 try:
-                    tp, comp_carpeta, gs, gsk = await scrape_una_competicion(p, url, filtro_cat)
+                    tp, comp_carpeta, gs, gsk = await scrape_una_competicion(
+                        p, url, filtro_cat, solo_grupos_club=_comp_id_y_slug(url)[1] not in slugs_configurados
+                    )
                     return (url, tp, "✅", comp_carpeta, gs, gsk, None)
                 except Exception as exc:
                     logger.error(f"❌ Error en competición: {exc}", exc_info=True)
@@ -1280,7 +1328,9 @@ async def scrape_todas(
                 logger.info(f"{'═' * 60}")
 
                 try:
-                    tp, comp_carpeta, gs, gsk = await scrape_una_competicion(page, url, filtro_cat)
+                    tp, comp_carpeta, gs, gsk = await scrape_una_competicion(
+                        page, url, filtro_cat, solo_grupos_club=_comp_id_y_slug(url)[1] not in slugs_configurados
+                    )
                     gran_total_partidos += tp
                     total_groups_scraped += gs
                     total_groups_skipped += gsk
@@ -1370,6 +1420,7 @@ async def modo_automatico(headless: bool = False, filtro_comp: Optional[str] = N
 # ─── CLI ─────────────────────────────────────────────────────────────────────
 
 def main():
+    global COMPETITIONS_FROM_DB
     parser = argparse.ArgumentParser(description="Scraper Baloncesto Cádiz")
     parser.add_argument("--watch", action="store_true", help="Modo automático")
     parser.add_argument("--competicion", type=str, default=None,
@@ -1386,8 +1437,7 @@ def main():
 
     # --from-db sobreescribe competitions_from_db del config para esta ejecución
     if args.from_db:
-        import scraper_competicion as _self
-        _self.COMPETITIONS_FROM_DB = True
+        COMPETITIONS_FROM_DB = True
 
     if args.watch:
         asyncio.run(modo_automatico(

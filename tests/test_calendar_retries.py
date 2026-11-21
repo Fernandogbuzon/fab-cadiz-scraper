@@ -20,7 +20,7 @@ class CalendarQuery:
     def not_(self):
         return self
 
-    def select(self, columns):
+    def select(self, columns, **kwargs):
         self.columns = columns
         return self
 
@@ -34,6 +34,13 @@ class CalendarQuery:
 
     def eq(self, column, value):
         self.filters.append((column, value))
+        return self
+
+    def order(self, column):
+        return self
+
+    def range(self, start, end):
+        self.bounds = slice(start, end + 1)
         return self
 
     def limit(self, value):
@@ -53,9 +60,11 @@ class CalendarQuery:
             self.database.deleted_batches.append(self.keys)
             return SimpleNamespace(data=[])
         if self.columns == "match_key, estado, hora":
-            return SimpleNamespace(data=[row for row in self.database.previous if row["match_key"] in self.keys])
-        if self.table == "matches" and self.columns == "match_key" and self.database.fail_cleanup:
-            raise RuntimeError("match cleanup unavailable")
+            if self.database.fail_cleanup:
+                raise RuntimeError("match lookup unavailable")
+            group = dict(self.filters)["group_id"]
+            rows = [row for row in self.database.previous if row.get("group_id", group) == group]
+            return SimpleNamespace(data=rows[self.bounds], count=len(rows))
         if self.table == "standings":
             self.database.events.append(("standings", None))
             if self.database.fail_standings:
@@ -133,6 +142,18 @@ class CalendarRetryTests(unittest.TestCase):
              patch.object(calendar, "logger"), \
              patch.object(calendar, "_upsert_matches_batch", side_effect=database.write_matches):
             return calendar.guardar_supabase(matches, standings or {}, "Junior", "Grupo A", "Regular", "Copa", "copa", "https://example.test/copa")
+
+    def test_legacy_key_owned_by_another_group_is_not_reused(self):
+        match = self.make_match()
+        other = {**self.previous(match), "group_id": "other-group"}
+        db = CalendarDatabase([other])
+        self.save(db, [match])
+        scoped_key = db.written[0]["match_key"]
+        self.assertNotEqual(scoped_key, other["match_key"])
+        self.assertEqual(db.deleted_batches, [])
+        again = CalendarDatabase([other, db.written[0]])
+        self.save(again, [match])
+        self.assertEqual(again.written[0]["match_key"], scoped_key)
 
     def test_changed_hour_resets_budget_in_both_directions_and_reopens_waiting_matches(self):
         earlier = self.make_match("CB Earlier", "16:00")

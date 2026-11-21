@@ -4,6 +4,22 @@ Scraping de calendarios y resultados de las competiciones de `team_config.json`,
 con persistencia en Supabase Central. No necesita servicios nuevos ni cambios de
 esquema para la programación adaptativa.
 
+## Categorías y equipos de ADESA 80
+
+En 2026/27 se siguen completas las Copas Andalucía A y B, Primer Año, Liga
+Pre-Minibasket y Programa Babybasket. En cada pasada general se recorren las
+categorías, fases y grupos publicados por la FAB. Con `discover_club_competitions`
+activado también se explora el índice de Cádiz. En las competiciones adicionales
+se incorpora el grupo cuando hay un partido del club fechado entre julio y junio
+de la temporada configurada. Si falla el índice se siguen las URLs configuradas.
+
+El scraper registra en `club_team_aliases` cada nombre federativo que contiene
+la marca completa del club, tanto en casa como fuera. La web puede así consultar
+variantes como «ADESA 80 A» y «ADESA 80 B» por su nombre exacto. Una inscripción
+con un nombre comercial sin la marca requiere identificarla explícitamente.
+Las altas de partidos incluyen el grupo en su clave. Los partidos ya publicados
+conservan su identificador y sus enlaces.
+
 ## Plan de mejora aplicado
 
 1. Un único detector y política de horarios para CI y el scraper de resultados.

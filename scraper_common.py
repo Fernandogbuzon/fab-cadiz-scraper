@@ -34,13 +34,22 @@ def legacy_fecha_key(fecha: str) -> str:
 def fecha_iso(fecha: str) -> str:
     """Convert DD/MM/YYYY or D/M/YYYY to YYYY-MM-DD. Return '' if invalid."""
     parts = (fecha or "").split("/")
-    if len(parts) != 3:
+    if len(parts) != 3 or not re.fullmatch(r"\d{4}", parts[2]):
         return ""
     try:
         d, m, y = (int(parts[0]), int(parts[1]), int(parts[2]))
-        return datetime(y, m, d).strftime("%Y-%m-%d")
-    except Exception:
+        return datetime(y, m, d).date().isoformat()
+    except ValueError:
         return ""
+
+
+def es_equipo_del_club(nombre: str, club: str) -> bool:
+    """Identifica la marca completa, también en ADESA80 o ADESA-80 VERDE."""
+    tokens = re.findall(r"[^\W\d_]+|\d+", slugify(club))
+    if not tokens:
+        return False
+    patron = r"[\W_]*".join(map(re.escape, tokens))
+    return bool(re.search(rf"(?<!\w){patron}(?!\w)", slugify(nombre)))
 
 
 def equipos_key(local: str, visitante: str) -> str:
