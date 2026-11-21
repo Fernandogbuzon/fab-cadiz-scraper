@@ -40,6 +40,7 @@ class ScraperCommonTests(unittest.TestCase):
         self.assertEqual(fecha_iso("5/4/2026"), "2026-04-05")
         self.assertEqual(fecha_iso("05/04/2026"), "2026-04-05")
         self.assertEqual(fecha_iso("no-date"), "")
+        self.assertEqual(fecha_iso("21/11/18"), "")
 
     def test_match_key_preserves_existing_contract(self):
         key = build_match_key("05/04/2026", "ADESA 80", "CB Cadiz", "Junior Masculino")

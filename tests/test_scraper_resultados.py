@@ -167,6 +167,14 @@ class ResultWriteTests(unittest.TestCase):
     def pending_db_row(self):
         return {**due_match(), "id": "id-a"}
 
+    def test_sibling_squad_cannot_receive_a_score_when_only_its_match_is_pending(self):
+        original = {**self.pending_db_row(), "local": "ADESA 80 VERDE"}
+        source = {**web_match(True), "local": "ADESA 80 BLANCO"}
+        db = MemorySupabase({"matches": [original]})
+        with patch.object(scraper, "get_supabase", return_value=db):
+            self.assertEqual(scraper.actualizar_supabase_resultados([source], group_id="group-a"), set())
+        self.assertFalse(db.tables["matches"][0]["es_resultado"])
+
     def test_failed_result_write_raises_instead_of_reporting_success(self):
         db = MemorySupabase({"matches": [self.pending_db_row()]}, fail=("matches", "upsert"))
         with (
@@ -189,7 +197,7 @@ class ResultWriteTests(unittest.TestCase):
         self.assertEqual(confirmed, {"match-a"})
         self.assertTrue(db.tables["matches"][0]["es_resultado"])
         self.assertEqual(db.tables["matches"][1]["marcador_local"], 50)
-        self.assertIn(("es_resultado", [False]), db.operations[0][2])
+        self.assertIn(("group_id", ["group-a"]), db.operations[0][2])
         self.assertEqual(len(db.operations[1][3]), 1)
 
     def test_source_without_score_does_not_read_or_write_matches(self):

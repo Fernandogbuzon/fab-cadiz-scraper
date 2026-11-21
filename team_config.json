@@ -8,8 +8,11 @@
   "competitions": [
     "https://www.andaluzabaloncesto.org/cadiz/delegacion-competicion-2740/comp-copa-andalucia-a",
     "https://www.andaluzabaloncesto.org/cadiz/delegacion-competicion-2741/comp-copa-andalucia-b",
-    "https://www.andaluzabaloncesto.org/cadiz/delegacion-competicion-2742/comp-1-a%C3%B1o"
+    "https://www.andaluzabaloncesto.org/cadiz/delegacion-competicion-2742/comp-1-a%C3%B1o",
+    "https://www.andaluzabaloncesto.org/cadiz/delegacion-competicion-2743/liga-pre-minibasket",
+    "https://www.andaluzabaloncesto.org/cadiz/delegacion-competicion-2744/programa-babybasket-20192020"
   ],
+  "discover_club_competitions": true,
 
   "match_duration_hours": 1,
   "max_retry_attempts": 11,
